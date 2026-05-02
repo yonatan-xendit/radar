@@ -249,10 +249,12 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	// may be incomplete because deferred informers are still syncing.
 	resp.DeferredLoading = !cache.IsDeferredSynced()
 
-	// If critical sync timed out, tell the frontend which resource kinds
-	// may be missing so it can show a banner.
-	if promoted := cache.PromotedKinds(); len(promoted) > 0 && resp.DeferredLoading {
-		resp.PartialData = promoted
+	// If critical informers were promoted at first paint, tell the
+	// frontend which kinds are STILL loading (live-filtered, not the
+	// snapshot from connect time) so the banner doesn't list kinds that
+	// have since populated.
+	if pending := cache.PendingPromotedKinds(); len(pending) > 0 {
+		resp.PartialData = pending
 	}
 
 	// --- Slow network calls: run in parallel ---

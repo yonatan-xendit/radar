@@ -11,7 +11,7 @@ import { NetworkPolicyCoverageCard } from './NetworkPolicyCoverageCard'
 import { CostCard } from './CostCard'
 import { AuditCard, PaneLoader, StatusDot, mapHealthToTone } from '@skyhook-io/k8s-ui'
 import { ClusterHealthCard } from './ClusterHealthCard'
-import { AlertTriangle, Shield } from 'lucide-react'
+import { AlertTriangle, Loader2, Shield } from 'lucide-react'
 import { clsx } from 'clsx'
 
 interface HomeViewProps {
@@ -58,9 +58,21 @@ export function HomeView({ namespaces, topology, onNavigateToView, onNavigateToR
 
   const hasProblems = data.problems && data.problems.length > 0
 
+  const stillLoading = data.deferredLoading || (data.partialData && data.partialData.length > 0)
+
   return (
     <div className="flex-1 overflow-y-auto">
       <div className="max-w-[1600px] mx-auto px-6 py-6 space-y-6">
+        {stillLoading && (
+          <div className="flex items-center gap-2 text-xs text-theme-text-tertiary">
+            <Loader2 className="w-3 h-3 animate-spin" />
+            <span>
+              {data.partialData && data.partialData.length > 0
+                ? `Still loading: ${data.partialData.join(', ')}`
+                : 'Loading remaining resources…'}
+            </span>
+          </div>
+        )}
         {/* Row 1: Cluster Health Card (combined health + resource counts) */}
         <ClusterHealthCard
           health={data.health}

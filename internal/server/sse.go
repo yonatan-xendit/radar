@@ -405,12 +405,16 @@ func (b *SSEBroadcaster) watchResourceChanges() {
 	}
 
 	// Debounce strategy:
-	// - During warmup (initial sync + CRD discovery): 3s to avoid constant
-	//   topology rebuilds from dynamic informer syncs. The UI shows a connecting
-	//   spinner anyway, so the delay is invisible.
+	// - During warmup: critical informers that didn't make the patience
+	//   window (e.g. ingresses, jobs, replicasets) plus deferred informers
+	//   plus dynamic CRD informers all stream in over the next 10–60s. We
+	//   want the topology graph to settle in a few coherent paints, not
+	//   jump on every arrival, so we coalesce into 5s windows. The UI is
+	//   already on the home view by this point with a "loading more" hint;
+	//   the slight delay is preferable to a fidgety graph.
 	// - After warmup: re-evaluate based on cluster size. Large clusters (>5000
 	//   resources) use 5s; smaller clusters use 500ms.
-	const warmupDebounce = 3 * time.Second
+	const warmupDebounce = 5 * time.Second
 	debounceDuration := warmupDebounce
 	b.watchMu.Lock()
 	warmupCh := b.warmupDone // local copy under lock; nil-ed after firing to avoid closed-channel spin

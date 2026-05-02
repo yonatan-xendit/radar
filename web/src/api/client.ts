@@ -272,7 +272,7 @@ export interface DashboardResponse {
   audit: DashboardAudit | null
   nodeVersionSkew: { versions: Record<string, string[]>; minVersion: string; maxVersion: string } | null
   deferredLoading?: boolean // True while deferred informers (secrets, events, etc.) are still syncing
-  partialData?: string[] // Resource kinds still loading after first paint (slow-cluster fallback)
+  partialData?: string[] // Critical kinds promoted at first paint that haven't yet finished syncing (live-filtered)
   accessRestricted?: boolean // True when user has no namespace access (RBAC)
 }
 

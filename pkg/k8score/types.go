@@ -141,11 +141,39 @@ type CacheConfig struct {
 	// In connector mode this is true.
 	SuppressInitialAdds bool
 
-	// SyncTimeout is the maximum time to wait for critical informers to sync
-	// before proceeding with partial data. Unsynced critical informers are
-	// promoted to deferred and continue syncing in the background.
-	// Zero means wait indefinitely (original behavior).
+	// SyncTimeout is a hard cap on the critical-informer wait. When it
+	// fires, unsynced critical informers are promoted to deferred and the
+	// cache returns. Always applies, including when PatienceWindow is set
+	// — in that case it acts as a backstop so a permanently-stuck informer
+	// doesn't trap the caller forever. Zero means wait indefinitely.
 	SyncTimeout time.Duration
+
+	// PatienceWindow is the soft deadline after which the cache returns as
+	// soon as MinimalSet (below) is fully synced. Critical informers not in
+	// MinimalSet that are still syncing are promoted to deferred so the
+	// caller can render a useful first paint while the rest stream in.
+	//
+	// When 0 or when MinimalSet is empty, this falls back to the legacy
+	// behavior controlled by SyncTimeout.
+	PatienceWindow time.Duration
+
+	// MinimalSet is the subset of critical resource types (keyed by
+	// ResourceType, e.g. Pods, Services) that the application considers
+	// the irreducible minimum for a useful first render. Once these are
+	// synced AND the patience window has elapsed, NewResourceCache
+	// returns even if other critical informers are still syncing.
+	//
+	// Keys must reference types also present in ResourceTypes. Members
+	// that are deferred or absent are ignored.
+	MinimalSet map[string]bool
+
+	// SyncProgress is invoked roughly every second during the critical
+	// sync phase, and once more when first paint is ready. `synced` and
+	// `total` count critical informers; `minimalReady` is true when the
+	// minimal set is satisfied AND the patience window has elapsed (i.e.
+	// the cache is about to return on the partial-paint path).
+	// Application code uses this to drive a "loading X of Y" indicator.
+	SyncProgress func(synced, total int, minimalReady bool)
 
 	// DeferredSyncTimeout caps how long we wait for deferred informers to
 	// finish syncing before giving up. When the deadline fires, deferredDone

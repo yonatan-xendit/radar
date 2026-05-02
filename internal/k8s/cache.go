@@ -65,6 +65,36 @@ var deferredResources = map[string]bool{
 	"limitranges":              true, // audit inheritance lookups, not first-render
 }
 
+// minimalFirstPaintSet is the subset of critical informers the home
+// dashboard needs to feel coherent. Pods are included despite being
+// typically the largest kind — without pods the topology graph and
+// resource counts are empty. The patience window absorbs pod-sync
+// latency on healthy clusters; on slow ones, the user sees a working
+// home view sooner with a "still loading" hint for the rest.
+var minimalFirstPaintSet = map[string]bool{
+	"pods":        true,
+	"namespaces":  true,
+	"nodes":       true,
+	"services":    true,
+	"deployments": true,
+}
+
+// firstPaintPatience is how long we wait for ALL critical informers before
+// falling back to the minimal set. On most clusters the full critical set
+// syncs well inside this window, so first paint is complete and there is
+// no progressive fill-in. Slow clusters fall through to the minimal-set
+// gate and render with whatever is ready then.
+const firstPaintPatience = 8 * time.Second
+
+// firstPaintBackstop is the hard upper bound on the critical-sync wait.
+// If the minimal set still hasn't synced after this long, give up and
+// render with whatever's available — the user gets the same partial-data
+// experience they'd see today (zeros + "Still loading: …" hint) instead
+// of being trapped on the connecting screen indefinitely. Picked to be
+// much longer than a healthy cluster's sync time but short enough that
+// a permanently-throttled API server doesn't make Radar feel broken.
+const firstPaintBackstop = 5 * time.Minute
+
 // ResourceChange is a type alias for the canonical definition in pkg/k8score.
 type ResourceChange = k8score.ResourceChange
 
@@ -139,7 +169,10 @@ func InitResourceCache(ctx context.Context) error {
 			Namespace:           permResult.Namespace,
 			DebugEvents:         DebugEvents,
 			TimingLogger:        logTiming,
-			SyncTimeout:         60 * time.Second,
+			PatienceWindow:      firstPaintPatience,
+			MinimalSet:          minimalFirstPaintSet,
+			SyncTimeout:         firstPaintBackstop,
+			SyncProgress:        emitSyncProgress,
 			DeferredSyncTimeout: 3 * time.Minute,
 
 			OnReceived: func(kind string) {
@@ -262,6 +295,33 @@ func recordK8sEventToTimeline(obj any) {
 	} else if DebugEvents {
 		timeline.IncrementRecorded("K8sEvent:" + event.InvolvedObject.Kind)
 	}
+}
+
+// emitSyncProgress is the SyncProgress callback wired into the resource
+// cache. It keeps the connection's progressMessage in step with the live
+// informer-sync count so the connecting screen ticks up instead of
+// sitting on a static message during a 30–60s sync. Once the cache
+// returns and connection state flips to "connected", further progress
+// lives in the home dashboard's deferred-loading indicator.
+func emitSyncProgress(synced, total int, minimalReady bool) {
+	if total == 0 {
+		return
+	}
+	// Only update while we're still in the connecting phase. Once
+	// connected, the connecting screen is gone and the message is moot.
+	if GetConnectionStatus().State != StateConnecting {
+		return
+	}
+	var msg string
+	switch {
+	case synced == total:
+		msg = "Finalizing…"
+	case minimalReady:
+		msg = fmt.Sprintf("Loading cluster data… %d of %d ready (showing partial)", synced, total)
+	default:
+		msg = fmt.Sprintf("Loading cluster data… %d of %d ready", synced, total)
+	}
+	UpdateConnectionProgress(msg)
 }
 
 // isNoisyResource returns true if this resource generates constant updates that aren't interesting

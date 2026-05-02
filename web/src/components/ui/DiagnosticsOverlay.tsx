@@ -358,13 +358,8 @@ function InformersSection({ data }: { data: DiagnosticsSnapshot }) {
 }
 
 function PendingInformers({ sync }: { sync: DiagCacheSyncStatus }) {
-  const pendingNames = new Set([
-    ...(sync.pendingCritical ?? []),
-    ...(sync.pendingDeferred ?? []),
-  ])
-  const pending = sync.informers.filter((i) => pendingNames.has(i.kind))
+  const pending = getPendingInformers(sync)
   if (pending.length === 0) return null
-  pending.sort((a, b) => Number(a.deferred) - Number(b.deferred) || a.kind.localeCompare(b.kind))
   return (
     <div className="mt-1.5 pt-1.5 border-t border-theme-border-light">
       <span className="text-[10px] text-theme-text-tertiary uppercase">Pending Informers ({pending.length})</span>
@@ -378,6 +373,16 @@ function PendingInformers({ sync }: { sync: DiagCacheSyncStatus }) {
       ))}
     </div>
   )
+}
+
+function getPendingInformers(sync: DiagCacheSyncStatus): DiagInformerSyncStatus[] {
+  const pendingNames = new Set([
+    ...(sync.pendingCritical ?? []),
+    ...(sync.pendingDeferred ?? []),
+  ])
+  return sync.informers
+    .filter((i) => pendingNames.has(i.kind))
+    .sort((a, b) => Number(a.deferred) - Number(b.deferred) || a.kind.localeCompare(b.kind))
 }
 
 function formatSyncPhase(phase: DiagSyncPhase): string {
@@ -592,13 +597,8 @@ function formatForGitHub(data: DiagnosticsSnapshot, includeRawJson = true): stri
       if (sync.promotedKinds && sync.promotedKinds.length > 0) {
         lines.push(`- **Promoted to Deferred:** ${sync.promotedKinds.join(', ')}`)
       }
-      const pendingNames = new Set([
-        ...(sync.pendingCritical ?? []),
-        ...(sync.pendingDeferred ?? []),
-      ])
-      const pending = sync.informers.filter((i) => pendingNames.has(i.kind))
+      const pending = getPendingInformers(sync)
       if (pending.length > 0) {
-        pending.sort((a, b) => Number(a.deferred) - Number(b.deferred) || a.kind.localeCompare(b.kind))
         const parts = pending.map((i) => `${i.kind}(${i.deferred ? 'deferred' : 'critical'},${i.items.toLocaleString()} items)`)
         lines.push(`- **Pending:** ${parts.join(', ')}`)
       }
