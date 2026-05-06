@@ -1,11 +1,23 @@
 package helm
 
 import (
+	"bytes"
+	"compress/gzip"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"helm.sh/helm/v3/pkg/chart"
+	"helm.sh/helm/v3/pkg/cli"
 	"helm.sh/helm/v3/pkg/release"
 	helmtime "helm.sh/helm/v3/pkg/time"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes/fake"
 )
 
 func TestFindBestUpgradeVersion(t *testing.T) {
@@ -40,11 +52,21 @@ func TestFindBestUpgradeVersion(t *testing.T) {
 			wantRepo:    "metallb",
 		},
 		{
-			name: "multiple repos both have current version - picks highest among them",
+			name: "multiple repos both have current version without affinity - bail out",
 			candidates: []repoVersionInfo{
-				{repoName: "repo-a", latestVersion: "2.0.0", hasCurrentVersion: true},
-				{repoName: "repo-b", latestVersion: "3.0.0", hasCurrentVersion: true},
+				{repoName: "repo-a", latestVersion: "2.0.0", hasCurrentVersion: true, repoURL: "https://charts.example-a.com"},
+				{repoName: "repo-b", latestVersion: "3.0.0", hasCurrentVersion: true, repoURL: "https://charts.example-b.com"},
 			},
+			wantVersion: "",
+			wantRepo:    "",
+		},
+		{
+			name: "multiple repos both have current version with affinity - picks matching repo",
+			candidates: []repoVersionInfo{
+				{repoName: "repo-a", latestVersion: "2.0.0", hasCurrentVersion: true, repoURL: "https://charts.example-a.com"},
+				{repoName: "repo-b", latestVersion: "3.0.0", hasCurrentVersion: true, repoURL: "https://charts.example-b.com"},
+			},
+			sourceHosts: []string{"example-b.com"},
 			wantVersion: "3.0.0",
 			wantRepo:    "repo-b",
 		},
@@ -258,6 +280,172 @@ func TestToHelmRelease_StorageNamespace(t *testing.T) {
 	if different.StorageNamespace != "flux-system" {
 		t.Fatalf("storage namespace = %q, want flux-system", different.StorageNamespace)
 	}
+}
+
+func TestHelmReleaseStorageNamespacesWithClient(t *testing.T) {
+	assertStorageNamespaceFromSecret(t, false)
+}
+
+func TestHelmReleaseStorageNamespacesWithClient_GzippedPayload(t *testing.T) {
+	assertStorageNamespaceFromSecret(t, true)
+}
+
+func assertStorageNamespaceFromSecret(t *testing.T, gzipped bool) {
+	t.Helper()
+	rel := &release.Release{
+		Name:      "podinfo",
+		Namespace: "demo-flux-helm",
+		Version:   1,
+		Info:      &release.Info{Status: release.StatusDeployed},
+		Chart:     &chart.Chart{Metadata: &chart.Metadata{Name: "podinfo", Version: "6.11.2"}},
+	}
+	payload, err := json.Marshal(rel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gzipped {
+		var b bytes.Buffer
+		w := gzip.NewWriter(&b)
+		if _, err := w.Write(payload); err != nil {
+			t.Fatal(err)
+		}
+		if err := w.Close(); err != nil {
+			t.Fatal(err)
+		}
+		payload = b.Bytes()
+	}
+
+	client := fake.NewSimpleClientset(&corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "sh.helm.release.v1.podinfo.v1",
+			Namespace: "flux-system",
+			Labels:    map[string]string{"owner": "helm"},
+		},
+		Data: map[string][]byte{
+			"release": []byte(base64.StdEncoding.EncodeToString(payload)),
+		},
+	})
+
+	storageNamespaces, err := helmReleaseStorageNamespacesWithClient(client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := storageNamespaces[releaseStorageKey(rel)]; got != "flux-system" {
+		t.Fatalf("storage namespace = %q, want flux-system", got)
+	}
+}
+
+func TestResolveUpgradeChartPath_UsesRepositoryHint(t *testing.T) {
+	client := testHelmClientWithRepos(t)
+
+	chartPath, repoName, err := client.resolveUpgradeChartPath("argo-cd", "9.5.11", "argo", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repoName != "argo" {
+		t.Fatalf("repo = %q, want argo", repoName)
+	}
+	if !strings.Contains(chartPath, "argoproj.github.io") {
+		t.Fatalf("chart path = %q, want argo repo URL", chartPath)
+	}
+}
+
+func TestResolveUpgradeChartPath_AmbiguousWithoutHintOrAffinity(t *testing.T) {
+	client := testHelmClientWithRepos(t)
+
+	_, _, err := client.resolveUpgradeChartPath("argo-cd", "9.5.11", "", nil)
+	if err == nil {
+		t.Fatal("expected ambiguous chart error")
+	}
+	if !strings.Contains(err.Error(), "could not identify upstream chart repository") {
+		t.Fatalf("error = %q", err)
+	}
+}
+
+func TestResolveUpgradeChartPath_UsesSourceAffinity(t *testing.T) {
+	client := testHelmClientWithRepos(t)
+
+	chartPath, repoName, err := client.resolveUpgradeChartPath("argo-cd", "9.5.11", "", []string{"argoproj.github.io"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repoName != "argo" {
+		t.Fatalf("repo = %q, want argo", repoName)
+	}
+	if !strings.Contains(chartPath, "argoproj.github.io") {
+		t.Fatalf("chart path = %q, want argo repo URL", chartPath)
+	}
+}
+
+func TestResolveUpgradeChartPath_RepositoryHintDoesNotFallback(t *testing.T) {
+	client := testHelmClientWithRepoVersions(t, map[string][]string{
+		"bitnami": {"9.5.11"},
+		"argo":    {"9.5.10"},
+	})
+
+	_, _, err := client.resolveUpgradeChartPath("argo-cd", "9.5.11", "argo", nil)
+	if err == nil {
+		t.Fatal("expected target version missing from hinted repo")
+	}
+	if !strings.Contains(err.Error(), "chart argo-cd version 9.5.11 not found in repository argo") {
+		t.Fatalf("error = %q", err)
+	}
+}
+
+func testHelmClientWithRepos(t *testing.T) *Client {
+	return testHelmClientWithRepoVersions(t, map[string][]string{
+		"bitnami": {"9.5.11"},
+		"argo":    {"9.5.11"},
+	})
+}
+
+func testHelmClientWithRepoVersions(t *testing.T, versionsByRepo map[string][]string) *Client {
+	t.Helper()
+	dir := t.TempDir()
+	cacheDir := filepath.Join(dir, "cache")
+	if err := os.Mkdir(cacheDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	repoFile := filepath.Join(dir, "repositories.yaml")
+	if err := os.WriteFile(repoFile, []byte(`apiVersion: v1
+generated: "2026-05-05T00:00:00Z"
+repositories:
+- name: bitnami
+  url: https://charts.bitnami.com/bitnami
+- name: argo
+  url: https://argoproj.github.io/argo-helm
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	writeIndex := func(name string, versions []string) {
+		t.Helper()
+		var b strings.Builder
+		b.WriteString(`apiVersion: v1
+entries:
+  argo-cd:
+`)
+		for _, version := range versions {
+			b.WriteString(fmt.Sprintf(`  - name: argo-cd
+    version: %s
+    urls:
+    - argo-cd-%s.tgz
+`, version, version))
+		}
+		b.WriteString(`generated: "2026-05-05T00:00:00Z"
+`)
+		if err := os.WriteFile(filepath.Join(cacheDir, name+"-index.yaml"), []byte(b.String()), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for name, versions := range versionsByRepo {
+		writeIndex(name, versions)
+	}
+
+	return &Client{settings: &cli.EnvSettings{
+		RepositoryConfig: repoFile,
+		RepositoryCache:  cacheDir,
+	}}
 }
 
 func TestCompareVersions(t *testing.T) {

@@ -90,10 +90,11 @@ export function HelmReleaseDrawer({ release, onClose, onNavigateToResource, isOp
   )
 
   // Lazy check for upgrade availability
-  const { data: upgradeInfo, isLoading: upgradeLoading } = useHelmUpgradeInfo(
+  const { data: upgradeInfo, isLoading: upgradeLoading, error: upgradeError } = useHelmUpgradeInfo(
     helmNamespace,
     release.name
   )
+  const upgradeErrorMessage = upgradeError instanceof Error ? upgradeError.message : 'Upgrade check failed'
 
   // Mutations for actions
   const uninstallMutation = useHelmUninstall()
@@ -239,6 +240,7 @@ export function HelmReleaseDrawer({ release, onClose, onNavigateToResource, isOp
         helmNamespace,
         release.name,
         upgradeInfo.latestVersion,
+        upgradeInfo.repositoryName,
         (event) => {
           if (event.type === 'progress' && event.message) {
             setUpgradeProgress(prev => [...prev, {
@@ -327,6 +329,13 @@ export function HelmReleaseDrawer({ release, onClose, onNavigateToResource, isOp
             {upgradeLoading ? (
               <span className="badge bg-theme-hover/50 text-theme-text-secondary animate-pulse">
                 checking...
+              </span>
+            ) : upgradeError ? (
+              <span
+                className="badge bg-theme-hover/50 text-theme-text-secondary"
+                title={upgradeErrorMessage}
+              >
+                upgrade check failed
               </span>
             ) : upgradeInfo?.updateAvailable ? (
               <button

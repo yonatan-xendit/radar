@@ -476,13 +476,14 @@ func (h *Handlers) handleUpgrade(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "version parameter is required")
 		return
 	}
+	repositoryName := r.URL.Query().Get("repository")
 
 	auth.AuditLog(r, namespace, name)
 	var upgradeErr error
 	if user := auth.UserFromContext(r.Context()); user != nil {
-		upgradeErr = client.UpgradeAsUser(namespace, name, version, user.Username, user.Groups)
+		upgradeErr = client.UpgradeAsUser(namespace, name, version, repositoryName, user.Username, user.Groups)
 	} else {
-		upgradeErr = client.Upgrade(namespace, name, version)
+		upgradeErr = client.Upgrade(namespace, name, version, repositoryName)
 	}
 	if err := upgradeErr; err != nil {
 		if IsForbiddenError(err) {
@@ -519,6 +520,7 @@ func (h *Handlers) handleUpgradeStream(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "version parameter is required")
 		return
 	}
+	repositoryName := r.URL.Query().Get("repository")
 
 	// Set up SSE headers
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -537,7 +539,11 @@ func (h *Handlers) handleUpgradeStream(w http.ResponseWriter, r *http.Request) {
 
 	resultCh := make(chan error, 1)
 	go func() {
-		resultCh <- client.UpgradeWithProgress(namespace, name, version, progressCh)
+		if user := auth.UserFromContext(r.Context()); user != nil {
+			resultCh <- client.UpgradeWithProgressAsUser(namespace, name, version, repositoryName, user.Username, user.Groups, progressCh)
+			return
+		}
+		resultCh <- client.UpgradeWithProgress(namespace, name, version, repositoryName, progressCh)
 	}()
 
 	for {
