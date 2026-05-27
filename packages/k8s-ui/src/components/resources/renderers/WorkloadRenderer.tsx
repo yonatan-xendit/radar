@@ -5,6 +5,7 @@ import { Section, PropertyList, Property, ConditionsSection, PodTemplateSection,
 import { DialogPortal } from '../../ui/DialogPortal'
 import type { RBACSubjectResponse, RBACPolicyRule } from '../../../types'
 import { detectBlastRadius, rulePermissivenessScore } from '../../../utils/rbac-blast-radius'
+import { RBACErrorSection, isRBACUnavailable } from './RBACErrorSection'
 import {
   rbacVerbBadgeClass,
   rbacResourceBadgeClass,
@@ -379,11 +380,11 @@ function WorkloadPermissionsSection({
     )
   }
   if (error) {
-    return (
-      <Section title={title} icon={Shield}>
-        <div className="text-sm text-red-400">Could not load permissions: {error.message}</div>
-      </Section>
-    )
+    // Permissions is a bonus section here; when RBAC is simply not available
+    // (cluster-static) or forbidden, hide it rather than repeat a note on every
+    // workload. Genuine faults still surface.
+    if (isRBACUnavailable(error)) return null
+    return <RBACErrorSection title={title} error={error} />
   }
   if (!rbacData) return null
 
