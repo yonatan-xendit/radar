@@ -11,6 +11,8 @@ export type NavigateToResource = (resource: SelectedResource) => void
 const BUILTIN_PLURAL_TO_KIND: Record<string, string> = {
   pods: 'Pod',
   services: 'Service',
+  endpoints: 'Endpoints', // already-plural resource name; englishPlural would yield "endpointses"
+  endpointslices: 'EndpointSlice',
   deployments: 'Deployment',
   daemonsets: 'DaemonSet',
   statefulsets: 'StatefulSet',
@@ -141,4 +143,18 @@ export function refToSelectedResource(ref: ResourceRef): SelectedResource {
     name: ref.name,
     group: ref.group,
   }
+}
+
+/**
+ * Extract the API group from an apiVersion string.
+ * Returns '' for core resources (e.g. "v1") and for missing/empty input.
+ * Examples:
+ *   "v1"                          → ""
+ *   "apps/v1"                     → "apps"
+ *   "cluster.x-k8s.io/v1beta1"    → "cluster.x-k8s.io"
+ */
+export function apiVersionToGroup(apiVersion?: string | null): string {
+  if (!apiVersion) return ''
+  const i = apiVersion.indexOf('/')
+  return i === -1 ? '' : apiVersion.slice(0, i)
 }

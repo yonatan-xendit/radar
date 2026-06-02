@@ -45,8 +45,12 @@ func stubDiscovery(t *testing.T, kind string, gvr schema.GroupVersionResource) *
 	rd := &ResourceDiscovery{
 		resourceMap: map[string]APIResource{
 			strings.ToLower(kind): {Kind: kind, Name: gvr.Resource, Group: gvr.Group, Version: gvr.Version, Namespaced: false},
+			gvr.Resource:          {Kind: kind, Name: gvr.Resource, Group: gvr.Group, Version: gvr.Version, Namespaced: false},
 		},
-		gvrMap: map[string]schema.GroupVersionResource{strings.ToLower(kind): gvr},
+		gvrMap: map[string]schema.GroupVersionResource{
+			strings.ToLower(kind): gvr,
+			gvr.Resource:          gvr,
+		},
 	}
 	return rd
 }
@@ -68,7 +72,7 @@ func TestUpdateResource_UsesServerSideApply(t *testing.T) {
 	})
 
 	_, err := mgr.UpdateResource(context.Background(), UpdateResourceOptions{
-		Kind: "ClusterPolicy",
+		Kind: "clusterpolicies",
 		Name: "restrict-image-registries",
 		YAML: clusterPolicyYAML,
 	})
@@ -126,5 +130,29 @@ func TestUpdateResource_RejectsMismatchedName(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "name mismatch") {
 		t.Fatalf("expected name mismatch error, got: %v", err)
+	}
+}
+
+func TestUpdateResource_RejectsMismatchedKind(t *testing.T) {
+	dyn, gvr := newFakeDynamicWithClusterPolicy(t)
+	disc := stubDiscovery(t, "ClusterPolicy", gvr)
+	podGVR := schema.GroupVersionResource{Group: "", Version: "v1", Resource: "pods"}
+	disc.resources = append(disc.resources,
+		APIResource{Kind: "ClusterPolicy", Name: gvr.Resource, Group: gvr.Group, Version: gvr.Version},
+		APIResource{Kind: "Pod", Name: podGVR.Resource, Group: podGVR.Group, Version: podGVR.Version},
+	)
+	disc.resourceMap["pod"] = APIResource{Kind: "Pod", Name: podGVR.Resource, Group: podGVR.Group, Version: podGVR.Version}
+	disc.resourceMap[podGVR.Resource] = APIResource{Kind: "Pod", Name: podGVR.Resource, Group: podGVR.Group, Version: podGVR.Version}
+	disc.gvrMap["pod"] = podGVR
+	disc.gvrMap[podGVR.Resource] = podGVR
+	mgr := NewWorkloadManager(dyn, disc)
+
+	_, err := mgr.UpdateResource(context.Background(), UpdateResourceOptions{
+		Kind: "Pod",
+		Name: "restrict-image-registries",
+		YAML: clusterPolicyYAML,
+	})
+	if err == nil || !strings.Contains(err.Error(), "kind mismatch") {
+		t.Fatalf("expected kind mismatch error, got: %v", err)
 	}
 }

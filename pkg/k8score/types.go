@@ -42,7 +42,12 @@ const (
 	PodDisruptionBudgets     ResourceType = "poddisruptionbudgets"
 	NetworkPolicies          ResourceType = "networkpolicies"
 	ServiceAccounts          ResourceType = "serviceaccounts"
+	Roles                    ResourceType = "roles"
+	ClusterRoles             ResourceType = "clusterroles"
+	RoleBindings             ResourceType = "rolebindings"
+	ClusterRoleBindings      ResourceType = "clusterrolebindings"
 	LimitRanges              ResourceType = "limitranges"
+	ResourceQuotas           ResourceType = "resourcequotas"
 )
 
 // Operation constants for resource change events.
@@ -54,7 +59,7 @@ const (
 
 // ResourceChange represents a resource change event from an informer callback.
 type ResourceChange struct {
-	Kind      string    // "Service", "Deployment", "Pod", etc.
+	Kind      string // "Service", "Deployment", "Pod", etc.
 	Namespace string
 	Name      string
 	UID       string
@@ -81,6 +86,14 @@ type OwnerInfo struct {
 	Name string `json:"name"`
 }
 
+// ResourceScope describes the access scope for a single resource type.
+// An empty Namespace means cluster-wide access; a non-empty Namespace means
+// the informer is restricted to that namespace.
+type ResourceScope struct {
+	Enabled   bool   // false = no informer (denied or not requested)
+	Namespace string // empty = cluster-wide
+}
+
 // CacheConfig holds configuration for creating a ResourceCache.
 type CacheConfig struct {
 	// Client is the Kubernetes clientset used to create informers.
@@ -89,7 +102,22 @@ type CacheConfig struct {
 	// ResourceTypes lists the resource types to watch. Each key is a
 	// ResourceType constant (e.g., Pods, Services). Only types present
 	// in this map with a true value will have informers created.
+	//
+	// Combined with NamespaceScoped+Namespace this gives a single uniform
+	// scope for every enabled informer. For mixed scopes (some kinds
+	// cluster-wide, some namespace-scoped), use ResourceScopes instead.
 	ResourceTypes map[string]bool
+
+	// ResourceScopes optionally specifies per-kind enablement and scope.
+	// When non-nil this takes precedence over ResourceTypes,
+	// NamespaceScoped, and Namespace — each kind is enabled (or not) and
+	// scoped (cluster-wide or to a single namespace) independently.
+	//
+	// This exists so callers that probe access per kind (e.g. to handle
+	// users with cluster-wide permission for a few resources but only
+	// namespaced permission for the rest) can wire each informer to the
+	// scope it actually has, instead of falling back to all-or-nothing.
+	ResourceScopes map[string]ResourceScope
 
 	// DeferredTypes lists resource types whose informers sync in the
 	// background after critical informers complete. Their listers return
@@ -182,6 +210,16 @@ type CacheConfig struct {
 	// unaffected. Zero means wait indefinitely.
 	DeferredSyncTimeout time.Duration
 
+	// ListPageSize, when > 0, makes high-cardinality informers fetch their
+	// initial LIST in pages of this size via a consistent (resourceVersion="")
+	// read instead of one unpaginated response. This mitigates response-read
+	// timeouts and memory spikes during initial sync on very large clusters
+	// where WatchList streaming isn't available — when it is, client-go streams
+	// the initial state and this path is never exercised. 0 (the default)
+	// keeps the standard factory behavior. Only kinds flagged in
+	// buildInformerSetups (currently Pods, ReplicaSets) paginate.
+	ListPageSize int64
+
 	// DebugEvents enables verbose event debug logging.
 	DebugEvents bool
 
@@ -245,6 +283,11 @@ type DynamicCacheConfig struct {
 	// NamespaceScoped restricts informers to a single namespace.
 	NamespaceScoped bool
 	Namespace       string
+
+	// NamespaceFallback is used when informers should prefer cluster-wide
+	// access but retry namespace-scoped after a cluster-wide 403/401.
+	// Ignored when NamespaceScoped is true.
+	NamespaceFallback string
 
 	// DebugEvents enables verbose debug logging.
 	DebugEvents bool

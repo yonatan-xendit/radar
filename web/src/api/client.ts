@@ -1,3 +1,4 @@
+import { useEffect, useRef } from 'react'
 import { useQuery, useMutation, useQueryClient, skipToken } from '@tanstack/react-query'
 import { showApiError, showApiSuccess } from '../components/ui/Toast'
 import { useCanHelmWrite } from '../contexts/CapabilitiesContext'
@@ -23,6 +24,8 @@ import type {
   InstallChartRequest,
   ArtifactHubSearchResult,
   ArtifactHubChartDetail,
+  GitOpsResourceTree,
+  GitOpsInsight,
 } from '../types'
 import type { GitOpsOperationResponse } from '../types/gitops'
 import { getApiBase, getAuthHeaders, getCredentialsMode, getBasename, routePath } from './config'
@@ -137,6 +140,9 @@ export interface WorkloadCount {
 export interface DashboardMetrics {
   cpu?: MetricSummary
   memory?: MetricSummary
+  // When false, only requests/capacity are meaningful — live usage (from
+  // metrics-server) is unavailable and usage fields are zero.
+  usageAvailable: boolean
 }
 
 export interface MetricSummary {
@@ -231,15 +237,19 @@ export interface DashboardCRDCount {
 }
 
 // Re-export shared types from k8s-ui — single source of truth
-import type { AuditCardData, AuditFinding, ResourceGroup, CheckMeta } from '@skyhook-io/k8s-ui'
+import type { AuditCardData, AuditFinding, ResourceGroup, CheckMeta, Check, Issue } from '@skyhook-io/k8s-ui'
 export type DashboardAudit = AuditCardData
-export type { AuditFinding, ResourceGroup, CheckMeta }
+export type { AuditFinding, ResourceGroup, CheckMeta, Check }
 
 export interface AuditResponse {
   summary: DashboardAudit
   findings: AuditFinding[]
   groups: ResourceGroup[]
   checks: Record<string, CheckMeta>
+  // Remediation-queue rollup: findings grouped by check, prioritized. Present
+  // on the non-raw scan (standalone + embedded per-cluster views); the Checks
+  // queue renders this.
+  groupedChecks?: Check[]
 }
 
 export interface DashboardCertificateHealth {
@@ -256,6 +266,31 @@ export interface DashboardNetworkPolicyCoverage {
   totalWorkloads: number
 }
 
+export interface DashboardGitOpsControllers {
+  // Aggregate roll-up across all detected controllers.
+  status: 'healthy' | 'degraded' | 'crashing'
+  controllers: DashboardGitOpsController[]
+}
+
+export interface DashboardGitOpsController {
+  name: string
+  // Tool vocabulary aligns with the backend `ctrlTool*` constants in
+  // internal/server/dashboard_gitops.go and the GitOps tree-builder
+  // tags in pkg/gitops/tree/graph.go (`gitopsTool`). Keep these three
+  // surfaces in sync — diverging vocabulary across surfaces was a real
+  // source of confusion until consolidated.
+  tool: 'argocd' | 'fluxcd'
+  namespace: string
+  ready: number
+  total: number
+  // Per-controller status (aggregate is in the parent and excludes
+  // 'pending' — it normalizes into 'degraded' there).
+  status: 'healthy' | 'degraded' | 'crashing' | 'pending'
+  // Reason for the crash when status === 'crashing'. Common values:
+  // "CrashLoopBackOff", "Error". Empty for non-crashing states.
+  crashReason?: string
+}
+
 export interface DashboardResponse {
   cluster: DashboardCluster
   health: DashboardHealth
@@ -270,6 +305,7 @@ export interface DashboardResponse {
   certificateHealth: DashboardCertificateHealth | null
   networkPolicyCoverage: DashboardNetworkPolicyCoverage | null
   audit: DashboardAudit | null
+  gitopsControllers: DashboardGitOpsControllers | null
   nodeVersionSkew: { versions: Record<string, string[]>; minVersion: string; maxVersion: string } | null
   deferredLoading?: boolean // True while deferred informers (secrets, events, etc.) are still syncing
   partialData?: string[] // Critical kinds promoted at first paint that haven't yet finished syncing (live-filtered)
@@ -298,6 +334,34 @@ export function useAudit(namespaces: string[] = []) {
     queryFn: () => fetchJSON(`/audit${params}`),
     staleTime: 30000,
     refetchInterval: 60000,
+    placeholderData: (prev) => prev,
+  })
+}
+
+// Live cluster Issues — the grouped triage queue (radar's /api/issues =
+// internal/issues.Compose+Classify+Group). Single-cluster here; the Hub fleet
+// view fans the same shape across clusters. keepPreviousData semantics via
+// placeholderData so the queue doesn't flash empty on the 30s refresh.
+// total = rows returned (after the cap); total_matched = rows that matched
+// before the cap. total_matched > total means the queue was truncated — surface
+// that honestly rather than presenting a capped list as if it were complete.
+export interface IssuesResponse {
+  issues: Issue[]
+  total?: number
+  total_matched?: number
+  // Present only when RBAC visibility is incomplete (absent = full access).
+  // state 'degraded' means core workload reads are denied, so an empty list may
+  // mean "can't see" rather than "nothing broken" — the UI must say so.
+  visibility?: { state?: string; impact?: string }
+}
+
+export function useIssues(namespaces: string[] = []) {
+  const params = namespaces.length > 0 ? `?namespaces=${namespaces.join(',')}` : ''
+  return useQuery<IssuesResponse>({
+    queryKey: ['issues', namespaces],
+    queryFn: () => fetchJSON(`/issues${params}`),
+    staleTime: 30000,
+    refetchInterval: 30000,
     placeholderData: (prev) => prev,
   })
 }
@@ -783,6 +847,46 @@ export function useTopology(namespaces: string[], viewMode: string = 'resources'
   })
 }
 
+export function useGitOpsTree(kind: string, namespace: string, name: string, group?: string, namespaces: string[] = []) {
+  const ns = namespace || '_'
+  const params = new URLSearchParams()
+  if (group) params.set('group', group)
+  if (namespaces.length > 0) params.set('namespaces', namespaces.join(','))
+  const queryString = params.toString()
+
+  return useQuery<GitOpsResourceTree>({
+    queryKey: ['gitops-tree', kind, namespace, name, group, namespaces],
+    queryFn: () => fetchJSON(`/gitops/tree/${kind}/${ns}/${name}${queryString ? `?${queryString}` : ''}`),
+    enabled: Boolean(kind && name),
+    staleTime: 5000,
+  })
+}
+
+// Poll fast (2s) while a sync/rollback is in flight so the user sees the
+// outcome quickly; otherwise rely on staleTime + manual refetch. Argo flips
+// operationState.phase from "Running" -> Succeeded/Failed when done, so this
+// auto-quiesces on completion.
+const INSIGHTS_RUNNING_POLL_MS = 2000
+
+export function useGitOpsInsights(kind: string, namespace: string, name: string, group?: string, namespaces: string[] = []) {
+  const ns = namespace || '_'
+  const params = new URLSearchParams()
+  if (group) params.set('group', group)
+  if (namespaces.length > 0) params.set('namespaces', namespaces.join(','))
+  const queryString = params.toString()
+
+  return useQuery<GitOpsInsight>({
+    queryKey: ['gitops-insights', kind, namespace, name, group, namespaces],
+    queryFn: () => fetchJSON(`/gitops/insights/${kind}/${ns}/${name}${queryString ? `?${queryString}` : ''}`),
+    enabled: Boolean(kind && name),
+    staleTime: 5000,
+    refetchInterval: (query) => {
+      const phase = query.state.data?.summary?.operationPhase
+      return phase === 'Running' ? INSIGHTS_RUNNING_POLL_MS : false
+    },
+  })
+}
+
 // Generic resource fetching - returns resource with relationships
 // Uses '_' as placeholder for cluster-scoped resources (empty namespace)
 export function useResource<T>(kind: string, namespace: string, name: string, group?: string) {
@@ -822,7 +926,12 @@ export function useResourceWithRelationships<T>(kind: string, namespace: string,
 }
 
 // List resources - queryKey includes group for cache sharing with ResourcesView
-export function useResources<T>(kind: string, namespace?: string, group?: string) {
+export function useResources<T>(
+  kind: string,
+  namespace?: string,
+  group?: string,
+  options?: { enabled?: boolean; refetchInterval?: number | false },
+) {
   const params = new URLSearchParams()
   if (namespace) params.set('namespace', namespace)
   if (group) params.set('group', group)
@@ -831,7 +940,9 @@ export function useResources<T>(kind: string, namespace?: string, group?: string
   return useQuery<T[]>({
     queryKey: ['resources', kind, group, namespace],
     queryFn: () => fetchJSON(`/resources/${kind}${queryString ? `?${queryString}` : ''}`),
+    enabled: (options?.enabled ?? true) && Boolean(kind),
     staleTime: 30000, // 30 seconds - matches refetchInterval in ResourcesView
+    refetchInterval: options?.refetchInterval,
   })
 }
 
@@ -1151,19 +1262,21 @@ export interface PrometheusStatus {
   error?: string
 }
 
-export interface PrometheusDataPoint {
-  timestamp: number
-  value: number
-}
+// Time-series sample types live in @skyhook-io/k8s-ui (shared with library
+// consumers). Re-export here so radar-app callers keep their existing import
+// paths; the Prom-prefixed names are deprecated aliases.
+export type {
+  TimeSeriesPoint,
+  TimeSeries,
+  PrometheusDataPoint,
+  PrometheusSeries,
+} from '@skyhook-io/k8s-ui/components/charts'
 
-export interface PrometheusSeries {
-  labels: Record<string, string>
-  dataPoints: PrometheusDataPoint[]
-}
+import type { TimeSeries as ChartTimeSeries } from '@skyhook-io/k8s-ui/components/charts'
 
 export interface PrometheusQueryResult {
   resultType: string
-  series: PrometheusSeries[]
+  series: ChartTimeSeries[]
 }
 
 export interface PrometheusResourceMetrics {
@@ -1178,8 +1291,43 @@ export interface PrometheusResourceMetrics {
   hint?: string  // Contextual hint when results are empty (e.g. cri-docker label issues)
 }
 
-export type PrometheusMetricCategory = 'cpu' | 'memory' | 'network_rx' | 'network_tx' | 'filesystem'
+export type PrometheusMetricCategory = 'cpu' | 'memory' | 'network_rx' | 'network_tx' | 'filesystem' | 'restarts'
 export type PrometheusTimeRange = '10m' | '30m' | '1h' | '3h' | '6h' | '12h' | '24h' | '48h' | '7d' | '14d'
+
+// PVC usage at a moment in time, derived from kubelet_volume_stats_*.
+// HasData=false silently indicates the CSI driver doesn't report or Prom
+// isn't scraping kubelet endpoints — UI should hide the gauge in that case.
+export interface PrometheusPVCUsage {
+  namespace: string
+  name: string
+  used: number
+  capacity: number
+  ratio: number
+  hasData: boolean
+}
+
+export type RightsizingTone = 'ok' | 'info' | 'warning' | 'alert' | 'critical'
+
+export interface RightsizingRow {
+  container: string
+  resource: 'cpu' | 'memory'
+  currentRequest?: string
+  currentLimit?: string
+  p95?: string
+  recommendedRequest?: string
+  tone: RightsizingTone
+  message: string
+}
+
+export interface PrometheusRightsizing {
+  kind: string
+  namespace: string
+  name: string
+  window: string
+  sampleAvailable: boolean
+  rows: RightsizingRow[]
+  reason?: string
+}
 
 // Check Prometheus availability
 export function usePrometheusStatus() {
@@ -1211,6 +1359,86 @@ export function usePrometheusConnect() {
       successMessage: 'Connected to Prometheus',
     },
   })
+}
+
+// Auto-discover Prometheus on first mount of any Prom-backed view, and
+// auto-reconnect across radar restarts on subsequent mounts.
+//
+// Two paths through this hook, both running once per cluster context per
+// component-instance:
+//   1. Cached path — localStorage flag means "Prom was discovered before on
+//      this context". Probe fires immediately on mount; the user sees
+//      charts populate without manual interaction.
+//   2. First-time path — no flag yet. Probe fires after a small delay so the
+//      initial workload-view render lands before we hit the cluster network.
+//      Behavior matches Lens / Headlamp defaults; the trade-off is one
+//      cluster probe per session per fresh kubeconfig context.
+//
+// On success either way we set the flag, so subsequent mounts take path 1.
+// On failure we clear the flag (path 1) or leave it cleared (path 2) and
+// reset attemptedRef, so the existing "Discover Prometheus" CTA renders
+// once status refreshes. Manual interaction stays available as the fallback.
+//
+// localStorage is the right surface: connection intent is browser-local,
+// not a server-side preference, and we want it to persist across radar
+// restarts on the same port.
+const PROM_AUTOCONNECT_PREFIX = 'radar.prometheus.autoConnect:'
+// First-mount delay before probing the cluster. Chosen short enough that the
+// CTA → charts transition feels prompt, long enough that the probe doesn't
+// race the initial workload-view render.
+const PROM_FIRSTLAUNCH_PROBE_DELAY_MS = 500
+
+function promAutoConnectKey(contextName: string): string {
+  return `${PROM_AUTOCONNECT_PREFIX}${contextName}`
+}
+
+export function useAutoPromConnect(): void {
+  const queryClient = useQueryClient()
+  const { data: clusterInfo } = useClusterInfo()
+  const { data: status, isLoading: statusLoading } = usePrometheusStatus()
+  const attemptedRef = useRef<string | null>(null)
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    const context = clusterInfo?.context
+    if (!context || statusLoading) return
+
+    // Persist the "we've connected here before" signal once a connection lands.
+    if (status?.connected) {
+      try { window.localStorage.setItem(promAutoConnectKey(context), '1') } catch {
+        // localStorage can throw in some restricted browser modes — fail open.
+      }
+      return
+    }
+
+    if (attemptedRef.current === context) return
+    let cached: string | null = null
+    try { cached = window.localStorage.getItem(promAutoConnectKey(context)) } catch {
+      cached = null
+    }
+
+    attemptedRef.current = context
+
+    // Cached path probes immediately; first-time path defers briefly so the
+    // initial UI render isn't competing with the cluster network call.
+    const delay = cached === '1' ? 0 : PROM_FIRSTLAUNCH_PROBE_DELAY_MS
+    const timeout = window.setTimeout(() => {
+      // Direct apiFetch (not via the usePrometheusConnect mutation) so the
+      // meta-driven toast handler stays silent — the user didn't click anything.
+      apiFetch(`${getApiBase()}/prometheus/connect`, { method: 'POST' })
+        .then(resp => {
+          if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
+          queryClient.invalidateQueries({ queryKey: ['prometheus-status'] })
+        })
+        .catch(() => {
+          try { window.localStorage.removeItem(promAutoConnectKey(context)) } catch {
+            // ignore — manual CTA will render once status refreshes
+          }
+          attemptedRef.current = null
+        })
+    }, delay)
+    return () => window.clearTimeout(timeout)
+  }, [clusterInfo?.context, status?.connected, statusLoading, queryClient])
 }
 
 // Fetch Prometheus metrics for a resource
@@ -1264,6 +1492,40 @@ export function usePrometheusClusterMetrics(
     queryFn: () =>
       fetchJSON(`/prometheus/cluster?category=${category}&range=${range}`),
     enabled,
+    staleTime: 30000,
+    refetchInterval: 60000,
+  })
+}
+
+// Fetch PVC usage. hasData=false when no series — UI should hide the gauge.
+export function usePrometheusPVCUsage(namespace: string, name: string, enabled = true) {
+  return useQuery<PrometheusPVCUsage>({
+    queryKey: ['prometheus-pvc-usage', namespace, name],
+    queryFn: () => fetchJSON(`/prometheus/pvc/${namespace}/${name}`),
+    enabled: enabled && Boolean(namespace && name),
+    staleTime: 60000,
+    refetchInterval: 120000,
+  })
+}
+
+// Fetch rightsizing recommendations for a workload (Deployment / StatefulSet / DaemonSet).
+export function usePrometheusRightsizing(kind: string, namespace: string, name: string, enabled = true) {
+  return useQuery<PrometheusRightsizing>({
+    queryKey: ['prometheus-rightsizing', kind, namespace, name],
+    queryFn: () => fetchJSON(`/prometheus/rightsizing/${kind}/${namespace}/${name}`),
+    enabled: enabled && Boolean(kind && namespace && name),
+    staleTime: 5 * 60 * 1000, // P95 over 24h is slow to shift; cache aggressively
+    refetchInterval: 10 * 60 * 1000,
+  })
+}
+
+// Raw PromQL query (range). Used by HPA charts for status_current_replicas etc.
+export function usePromQLRange(query: string, range: PrometheusTimeRange = '1h', enabled = true) {
+  return useQuery<PrometheusQueryResult>({
+    queryKey: ['promql-range', query, range],
+    queryFn: () =>
+      fetchJSON(`/prometheus/query?query=${encodeURIComponent(query)}&range=${range}`),
+    enabled: enabled && Boolean(query),
     staleTime: 30000,
     refetchInterval: 60000,
   })
@@ -1348,6 +1610,7 @@ export interface AvailablePort {
   protocol: string
   containerName?: string
   name?: string
+  scheme?: 'http' | 'https'
 }
 
 export function useAvailablePorts(type: 'pod' | 'service', namespace: string, name: string) {
@@ -1384,8 +1647,24 @@ export function useUpdateResource() {
       errorMessage: 'Failed to update resource',
       successMessage: 'Resource updated',
     },
-    onSuccess: (_, variables) => {
-      queryClient.invalidateQueries({ queryKey: ['resource', variables.kind, variables.namespace, variables.name] })
+    onSuccess: (updated: any, variables) => {
+      // The PUT goes straight to the apiserver and returns the authoritative
+      // object, but the GET behind this query reads Radar's informer cache,
+      // which lags a write by one watch round-trip. Seed the detail cache with
+      // the PUT response so the edit shows immediately. Invalidating here
+      // instead would trigger a refetch that races the seed and re-reads the
+      // lagging cache — the change appears not to have taken effect.
+      if (updated && typeof updated === 'object' && updated.metadata) {
+        queryClient.setQueriesData(
+          { queryKey: ['resource', variables.kind, variables.namespace, variables.name] },
+          (old: any) =>
+            old && typeof old === 'object' && 'resource' in old
+              ? { ...old, resource: updated }
+              : { resource: updated }
+        )
+      } else {
+        queryClient.invalidateQueries({ queryKey: ['resource', variables.kind, variables.namespace, variables.name] })
+      }
       queryClient.invalidateQueries({ queryKey: ['resources', variables.kind] })
       queryClient.invalidateQueries({ queryKey: ['topology'] })
     },
@@ -2079,29 +2358,49 @@ export function useHelmRepositories() {
   })
 }
 
+// Shared mutation fn + cache invalidation for the helm-repo
+// update endpoint. Hoisted so useUpdateRepository and
+// useUpdateRepositorySilent can't drift on URL, error parsing, or
+// invalidation keys — only the toast meta differs.
+async function updateRepositoryFn(repoName: string): Promise<unknown> {
+  const response = await apiFetch(`${getApiBase()}/helm/repositories/${repoName}/update`, {
+    method: 'POST',
+  })
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({ error: 'Unknown error' }))
+    throw new Error(error.error || `HTTP ${response.status}`)
+  }
+  return response.json()
+}
+
+function invalidateHelmAfterRepoUpdate(queryClient: ReturnType<typeof useQueryClient>) {
+  queryClient.invalidateQueries({ queryKey: ['helm-repositories'] })
+  queryClient.invalidateQueries({ queryKey: ['helm-charts'] })
+}
+
 // Update a repository index
 export function useUpdateRepository() {
   const queryClient = useQueryClient()
-
   return useMutation({
-    mutationFn: async (repoName: string) => {
-      const response = await apiFetch(`${getApiBase()}/helm/repositories/${repoName}/update`, {
-        method: 'POST',
-      })
-      if (!response.ok) {
-        const error = await response.json().catch(() => ({ error: 'Unknown error' }))
-        throw new Error(error.error || `HTTP ${response.status}`)
-      }
-      return response.json()
-    },
+    mutationFn: updateRepositoryFn,
     meta: {
       errorMessage: 'Failed to update repository',
       successMessage: 'Repository updated',
     },
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['helm-repositories'] })
-      queryClient.invalidateQueries({ queryKey: ['helm-charts'] })
-    },
+    onSuccess: () => invalidateHelmAfterRepoUpdate(queryClient),
+  })
+}
+
+// Same endpoint as useUpdateRepository but without meta — the
+// caller surfaces ONE aggregate toast for the whole batch, so the
+// global MutationCache must NOT fire a per-call toast (otherwise
+// N failures = N identical "Failed to update repository" toasts
+// with no repo name).
+export function useUpdateRepositorySilent() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: updateRepositoryFn,
+    onSuccess: () => invalidateHelmAfterRepoUpdate(queryClient),
   })
 }
 
@@ -2231,6 +2530,7 @@ export function useArtifactHubChart(repoName: string, chartName: string, version
 
 interface GitOpsMutationConfig<TVariables> {
   getPath: (variables: TVariables) => string
+  getBody?: (variables: TVariables) => unknown
   errorMessage: string
   successMessage: string
   getInvalidateKeys: (variables: TVariables) => (string | undefined)[][]
@@ -2247,6 +2547,8 @@ function createGitOpsMutation<TVariables>(config: GitOpsMutationConfig<TVariable
       mutationFn: async (variables: TVariables): Promise<GitOpsOperationResponse> => {
         const response = await apiFetch(`${getApiBase()}${config.getPath(variables)}`, {
           method: 'POST',
+          headers: config.getBody ? { 'Content-Type': 'application/json' } : undefined,
+          body: config.getBody ? JSON.stringify(config.getBody(variables)) : undefined,
         })
         if (!response.ok) {
           const error = await response.json().catch(() => ({ error: 'Unknown error' }))
@@ -2269,16 +2571,46 @@ function createGitOpsMutation<TVariables>(config: GitOpsMutationConfig<TVariable
 
 // Common variable types
 type FluxResourceVars = { kind: string; namespace: string; name: string }
+// ArgoAppVars identifies the target Application. Used by mutations that don't
+// take a body (terminate, suspend, resume, refresh).
 type ArgoAppVars = { namespace: string; name: string }
+// ArgoSyncVars extends ArgoAppVars with the sync request body fields. Only
+// useArgoSync sends these — splitting the type prevents callers from passing
+// resources/revision/prune to mutations that would silently drop them.
+type ArgoSyncVars = ArgoAppVars & {
+  resources?: Array<{ group?: string; kind: string; namespace?: string; name: string }>
+  revision?: string
+  prune?: boolean
+  dryRun?: boolean
+  force?: boolean
+  applyOnly?: boolean
+  // Free-form Argo SyncOption strings, e.g. "Replace=true",
+  // "ServerSideApply=true", "PruneLast=true". Caller is responsible for
+  // spelling.
+  syncOptions?: string[]
+}
+
+// ArgoRollbackVars targets a specific Argo history entry by ID. Prune and
+// DryRun mirror the sync flags so the rollback dialog can offer the same
+// safety net.
+type ArgoRollbackVars = ArgoAppVars & {
+  id: number
+  prune?: boolean
+  dryRun?: boolean
+}
 
 // Standard invalidation patterns
 const fluxInvalidateKeys = (v: FluxResourceVars) => [
   ['resources', v.kind],
   ['resource', v.kind, v.namespace, v.name],
+  ['gitops-tree', v.kind, v.namespace, v.name],
+  ['gitops-insights', v.kind, v.namespace, v.name],
 ]
 const argoInvalidateKeys = (v: ArgoAppVars) => [
   ['resources', 'applications'],
   ['resource', 'applications', v.namespace, v.name],
+  ['gitops-tree', 'applications', v.namespace, v.name],
+  ['gitops-insights', 'applications', v.namespace, v.name],
 ]
 
 // ============================================================================
@@ -2323,10 +2655,27 @@ export const useFluxSyncWithSource = createGitOpsMutation<FluxResourceVars>({
 // ArgoCD API hooks
 // ============================================================================
 
-export const useArgoSync = createGitOpsMutation<ArgoAppVars>({
+export const useArgoSync = createGitOpsMutation<ArgoSyncVars>({
   getPath: (v) => `/argo/applications/${v.namespace}/${v.name}/sync`,
+  getBody: (v) => ({
+    resources: v.resources,
+    revision: v.revision,
+    prune: v.prune,
+    dryRun: v.dryRun,
+    force: v.force,
+    applyOnly: v.applyOnly,
+    syncOptions: v.syncOptions,
+  }),
   errorMessage: 'Failed to trigger sync',
   successMessage: 'Sync initiated',
+  getInvalidateKeys: argoInvalidateKeys,
+})
+
+export const useArgoRollback = createGitOpsMutation<ArgoRollbackVars>({
+  getPath: (v) => `/argo/applications/${v.namespace}/${v.name}/rollback`,
+  getBody: (v) => ({ id: v.id, prune: v.prune, dryRun: v.dryRun }),
+  errorMessage: 'Failed to roll back application',
+  successMessage: 'Rollback initiated',
   getInvalidateKeys: argoInvalidateKeys,
 })
 
@@ -2372,8 +2721,13 @@ export function useArgoRefresh() {
       successMessage: 'Application refreshed',
     },
     onSuccess: (_, variables) => {
-      queryClient.invalidateQueries({ queryKey: ['resources', 'applications'] })
-      queryClient.invalidateQueries({ queryKey: ['resource', 'applications', variables.namespace, variables.name] })
+      // Match the standard Argo invalidation set so the GitOps detail page
+      // (insights strip, resource tree) refetches after Refresh / Hard
+      // Refresh — without these two extra keys the user clicks Refresh and
+      // sees stale insight/tree data until the next staleTime tick.
+      argoInvalidateKeys(variables).forEach((key) =>
+        queryClient.invalidateQueries({ queryKey: key })
+      )
     },
   })
 }
@@ -2446,6 +2800,114 @@ export function useSwitchContext() {
       // current context after a failed switch (backend has already switched
       // the in-memory context even though connectivity failed).
       queryClient.invalidateQueries({ queryKey: ['contexts'] })
+    },
+  })
+}
+
+// ============================================================================
+// Active namespace switcher
+// ============================================================================
+
+export interface NamespaceScope {
+  actives: string[]
+  kubeconfigNamespace: string
+  /**
+   * 'cluster-wide' — no per-user pick; user can list across namespaces.
+   * 'namespace'    — per-user view filter pinned to one or more namespaces.
+   * 'restricted'   — user can't list namespaces and isn't pinned to any.
+   */
+  mode: 'cluster-wide' | 'namespace' | 'restricted'
+  accessibleNamespaces: string[]
+  /** false when accessibleNamespaces is a best-effort short list (no list perm). */
+  authoritative: boolean
+  /** false when clearing would leave no usable namespace fallback. */
+  canClearNamespace: boolean
+}
+
+export function useNamespaceScope() {
+  return useQuery<NamespaceScope>({
+    queryKey: ['namespace-scope'],
+    queryFn: () => fetchJSON('/cluster/namespace-scope'),
+    staleTime: 30000,
+  })
+}
+
+const NAMESPACE_SWITCH_TIMEOUT = 5000
+
+export function debugNamespaceLog(label: string, payload?: Record<string, unknown>) {
+  if (typeof window === 'undefined') return
+  const enabled = window.localStorage.getItem('radar:debug:namespaces')
+  if (enabled !== '1' && enabled !== 'true') return
+  console.log(`[namespace-debug] ${label}`, {
+    t: Math.round(performance.now()),
+    href: window.location.href,
+    ...payload,
+  })
+}
+
+export function useSetActiveNamespace() {
+  const queryClient = useQueryClient()
+  return useMutation<NamespaceScope, Error, { namespaces: string[] }>({
+    meta: {
+      // Surface 403s (RBAC drift, denied bookmark) and network errors via the
+      // global toast. Without this, App.tsx call sites that mutate without
+      // their own onError (bookmark reconciliation, back-nav, topology
+      // maximize/clear, command palette) silently revert when the scope
+      // refetches and the mirror effect overwrites local state.
+      errorMessage: 'Failed to update namespace selection',
+    },
+    mutationFn: async ({ namespaces }) => {
+      debugNamespaceLog('mutation:start', { namespaces })
+      const controller = new AbortController()
+      const timeoutId = setTimeout(() => controller.abort(), NAMESPACE_SWITCH_TIMEOUT)
+      const startedAt = performance.now()
+      try {
+        const response = await apiFetch(`${getApiBase()}/cluster/namespace`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ namespaces }),
+          signal: controller.signal,
+        })
+        clearTimeout(timeoutId)
+        debugNamespaceLog('mutation:response', {
+          namespaces,
+          status: response.status,
+          durationMs: Math.round(performance.now() - startedAt),
+        })
+        if (!response.ok) {
+          const error = await response.json().catch(() => ({ error: 'Unknown error' }))
+          throw new Error(error.error || `HTTP ${response.status}`)
+        }
+        return response.json()
+      } catch (error) {
+        clearTimeout(timeoutId)
+        debugNamespaceLog('mutation:error', {
+          namespaces,
+          durationMs: Math.round(performance.now() - startedAt),
+          error: error instanceof Error ? error.message : String(error),
+        })
+        if (error instanceof Error && error.name === 'AbortError') {
+          throw new Error('Namespace switch timed out. The cluster may be unreachable.')
+        }
+        throw error
+      }
+    },
+    onSuccess: (scope) => {
+      debugNamespaceLog('mutation:success-before-scope-cache-write', {
+        actives: scope.actives,
+        mode: scope.mode,
+        accessibleCount: scope.accessibleNamespaces.length,
+      })
+      queryClient.setQueryData<NamespaceScope>(['namespace-scope'], scope)
+      debugNamespaceLog('mutation:success-after-scope-cache-write')
+    },
+    onError: () => {
+      // A failed switch can leave the server's stored pick out of sync
+      // with the cached scope (network timeout after the server wrote;
+      // partial mutation). Refetch so the displayed picker matches what
+      // the server actually persisted instead of what we assumed.
+      debugNamespaceLog('mutation:on-error-invalidate-scope')
+      queryClient.invalidateQueries({ queryKey: ['namespace-scope'] })
     },
   })
 }
@@ -2621,6 +3083,9 @@ export interface DiagInformerSyncStatus {
   synced: boolean
   syncedAt?: string
   items: number
+  lastError?: string
+  lastErrorAt?: string
+  forbiddenSeen?: boolean
 }
 
 export interface DiagCacheSyncStatus {
@@ -2635,6 +3100,31 @@ export interface DiagCacheSyncStatus {
   pendingCritical?: string[]
   pendingDeferred?: string[]
   promotedKinds?: string[]
+}
+
+export interface DiagSampleWindow {
+  count: number
+  last: number
+  min: number
+  p50: number
+  p95: number
+  p99: number
+  max: number
+}
+
+export interface DiagPerfSnapshot {
+  topology: {
+    totalBuilds: number
+    durationUs: DiagSampleWindow
+    nodeCount: DiagSampleWindow
+    edgeCount: DiagSampleWindow
+    payloadBytes: DiagSampleWindow
+    estimatedNodes: DiagSampleWindow
+  }
+  sse: {
+    totalBroadcasts: number
+    totalDrops: number
+  }
 }
 
 export interface DiagnosticsSnapshot {
@@ -2731,6 +3221,7 @@ export interface DiagnosticsSnapshot {
   sse?: {
     connectedClients: number
   }
+  perf?: DiagPerfSnapshot
   runtime?: {
     heapMB: number
     heapObjectsK: number
@@ -2746,6 +3237,7 @@ export interface DiagnosticsSnapshot {
     debugEvents: boolean
     mcpEnabled: boolean
     hasPrometheusURL: boolean
+    hasPrometheusHeaders: boolean
   }
   recentErrors?: DiagErrorEntry[]
   totalErrorsRecorded?: number

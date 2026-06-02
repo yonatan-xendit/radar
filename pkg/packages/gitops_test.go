@@ -218,3 +218,42 @@ func TestFluxConditionStatus_NoConditions(t *testing.T) {
 		t.Errorf("empty status → unknown, got %q", got)
 	}
 }
+
+// TestIsTransientConditionReason pins the shared transient-reason set that gates
+// both the GitOps health badge (degraded vs unhealthy) and the Issues CRD noise
+// floor (suppress vs emit). The membership of these reasons — and the deliberate
+// exclusion of "Unknown" — is load-bearing; a silent edit would flip suppression
+// behavior on both paths with no other failing test.
+func TestIsTransientConditionReason(t *testing.T) {
+	transient := []string{
+		"Progressing", "DependencyNotReady", "ReconciliationInProgress", "ChartNotReady", "ArtifactFailed",
+		"Reconciling", "Creating", "Issuing", "Pending", "InProgress", "Initializing", "Waiting",
+	}
+	for _, r := range transient {
+		if !IsTransientConditionReason(r) {
+			t.Errorf("IsTransientConditionReason(%q) = false, want true (in-progress reason)", r)
+		}
+	}
+	// "Unknown" means the controller hasn't reported a verdict (ambiguous), not
+	// in-progress — it must stay loud. Empty and hard-failure reasons too.
+	for _, r := range []string{"Unknown", "", "BuildFailed", "InstallFailed"} {
+		if IsTransientConditionReason(r) {
+			t.Errorf("IsTransientConditionReason(%q) = true, want false", r)
+		}
+	}
+}
+
+// A False Ready whose reason is Unknown stays unhealthy — the loud-on-ambiguous
+// invariant, complementing the transient-reason degraded path above.
+func TestFluxConditionStatus_UnknownReasonStaysUnhealthy(t *testing.T) {
+	obj := map[string]any{
+		"status": map[string]any{
+			"conditions": []any{
+				map[string]any{"type": "Ready", "status": "False", "reason": "Unknown"},
+			},
+		},
+	}
+	if got := fluxConditionStatus(obj); got != "unhealthy" {
+		t.Errorf("Ready=False reason=Unknown should stay unhealthy, got %q", got)
+	}
+}

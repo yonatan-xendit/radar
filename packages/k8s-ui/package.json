@@ -31,9 +31,19 @@
       "./src/components/gitops/*.tsx",
       "./src/components/gitops/*.ts"
     ],
+    "./components/issues": "./src/components/issues/index.ts",
+    "./components/issues/*": [
+      "./src/components/issues/*.tsx",
+      "./src/components/issues/*.ts"
+    ],
     "./components/timeline/*": [
       "./src/components/timeline/*.tsx",
       "./src/components/timeline/*.ts"
+    ],
+    "./components/charts": "./src/components/charts/index.ts",
+    "./components/charts/*": [
+      "./src/components/charts/*.tsx",
+      "./src/components/charts/*.ts"
     ],
     "./hooks/*": [
       "./src/hooks/*.ts",
@@ -58,7 +68,7 @@
   "dependencies": {
     "@monaco-editor/react": "^4.7.0",
     "html-to-image": "^1.11.0",
-    "react-virtuoso": "^4.18.6",
+    "react-virtuoso": "^4.18.7",
     "shiki": "^4.0.0"
   },
   "peerDependencies": {
@@ -85,11 +95,11 @@
     "clsx": "^2.1.1",
     "diff": "^9.0.0",
     "elkjs": "^0.11.1",
-    "lucide-react": "^1.12.0",
-    "react": "^19.2.4",
-    "react-dom": "^19.2.4",
+    "lucide-react": "^1.16.0",
+    "react": "^19.2.6",
+    "react-dom": "^19.2.6",
     "typescript": "^6.0.2",
     "vitest": "^4.1.5",
-    "yaml": "^2.8.3"
+    "yaml": "^2.9.0"
   }
 }

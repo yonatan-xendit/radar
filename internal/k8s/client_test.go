@@ -22,10 +22,10 @@ func newExecAuthInfo(command string) *clientcmdapi.AuthInfo {
 
 func TestCollectExecPluginCommands(t *testing.T) {
 	tests := []struct {
-		name           string
-		config         *clientcmdapi.Config
-		wantCmds       []string
-		wantEmptyAIs   []string
+		name         string
+		config       *clientcmdapi.Config
+		wantCmds     []string
+		wantEmptyAIs []string
 	}{
 		{
 			name:   "nil config",

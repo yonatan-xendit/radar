@@ -141,11 +141,16 @@ radar
 | `--no-browser` | `false` | Don't auto-open browser |
 | `--timeline-storage` | `memory` | Timeline storage backend: `memory` or `sqlite` |
 | `--timeline-db` | `~/.radar/timeline.db` | Path to SQLite database (when using sqlite storage) |
+| `--timeline-max-size` | `0` | Maximum SQLite DB + WAL size before pruning oldest events (e.g. `800Mi`, `8Gi`; `0` disables) |
 | `--history-limit` | `10000` | Maximum events to retain in timeline |
 | `--disable-exec` | `false` | Disable terminal and debug shell |
 | `--disable-helm-write` | `false` | Disable Helm write operations |
 | `--disable-local-terminal` | `false` | Disable local terminal feature |
+| `--debug-image` | `busybox:latest` | Image for ephemeral debug containers and node debug pods. Point at a mirror for air-gapped / private-registry clusters. |
+| `--list-page-size` | `0` (off) | Paginate the initial LIST of high-cardinality kinds (Pods, ReplicaSets) at this size. Helps very large clusters that fail to sync; only used when WatchList streaming is unavailable. Try `2000`. |
 | `--prometheus-url` | (auto-discover) | Manual Prometheus/VictoriaMetrics URL (skips auto-discovery) |
+| `--prometheus-header` | | HTTP header sent with every Prometheus request, format `Key=Value` (repeatable). Required for auth-protected backends. |
+| `--prometheus-header-from-env` | | HTTP header sent with every Prometheus request, sourced from an environment variable, format `Key=ENV_VAR` (repeatable). |
 | `--auth-mode` | `none` | Authentication mode: `none`, `proxy`, or `oidc` ([details](docs/authentication.md)) |
 | `--no-mcp` | `false` | Disable MCP server for AI tool integration |
 | `--version` | | Show version and exit |
@@ -225,6 +230,28 @@ Manage Helm releases deployed in your cluster.
 - Inspect values, compare revisions, view release history
 - Upgrade, rollback, or uninstall releases directly from the UI
 
+### Compare Resources
+
+Diff any two Kubernetes resources of the same kind side-by-side — like comparing a staging Deployment to its production sibling, or two pods that should be identical but aren't.
+
+<p align="center">
+  <img src="docs/screenshots/compare-view.png" alt="Compare View" width="800">
+  <br><em>Compare View — Side-by-side YAML diff with field-level highlighting</em>
+</p>
+
+- **Two entry points**: a `Compare` button in the resource detail drawer, or compare mode in the resource table (toggle, pick two rows, hit Compare)
+- **Side-by-side or unified** view, with one-click swap of A ↔ B
+- **Diff-only mode** collapses unchanged regions so you only see what differs
+- **Spec-only mode** drops `status` fields to focus on intent rather than observed state
+- Server-assigned noise (`managedFields`, `resourceVersion`, `kubectl.kubernetes.io/last-applied-configuration`) is stripped automatically so the diff stays signal — flip **Raw metadata** on if you actually want to see it
+- Same-namespace candidates are surfaced first in the picker — usually the resource you want to compare against
+- Shareable URLs: `/compare?kind=&apiGroup=&a=ns/name&b=ns/name`
+
+<p align="center">
+  <img src="docs/screenshots/compare-mode-tray.png" alt="Compare Mode Tray" width="800">
+  <br><em>Compare mode in the resource table — pick two rows, hit Compare</em>
+</p>
+
 ### TLS Certificate Management
 
 View TLS certificate details and expiry dates across all namespaces — catch expiring certificates before they cause outages.
@@ -235,14 +262,20 @@ View TLS certificate details and expiry dates across all namespaces — catch ex
 
 ### GitOps
 
-Monitor and manage FluxCD and ArgoCD resources with unified status views and actions.
+Monitor, diagnose, and manage FluxCD and ArgoCD resources from a dedicated GitOps workspace.
 
-- **FluxCD**: GitRepository, OCIRepository, HelmRepository, Kustomization, HelmRelease, Alert
-- **ArgoCD**: Application, ApplicationSet, AppProject
-- Real-time sync status, health indicators, and reconciliation countdowns
-- Trigger reconciliation, suspend/resume resources, and view managed resource inventory
-- Problem detection with clear alerts for degraded or out-of-sync resources
-- **Note**: Topology connections between GitOps resources and managed workloads only appear when both are in the same cluster. FluxCD typically deploys to its own cluster. ArgoCD often manages remote clusters — connect Radar to the target cluster to see workloads, or to the ArgoCD cluster to see Application status.
+<p align="center">
+  <img src="docs/screenshots/gitops-view.png" alt="GitOps fleet view" width="800">
+  <br><em>GitOps fleet view — Argo + Flux applications side-by-side with sync, health, source, destination, and lifecycle state</em>
+</p>
+
+- Fleet view + per-app detail page (Topology / Changes / Activity tabs) for **ArgoCD** (`Application`, `ApplicationSet`, `AppProject`) and **FluxCD** (`GitRepository`, `OCIRepository`, `HelmRepository`, `Bucket`, `Kustomization`, `HelmRelease`, `Alert`)
+- **Diagnosis pipeline** — field-level drift, recent events per resource, stuck-drift-loop detection, parsed operation-failures, structured one-click remediation
+- **Lifecycle awareness** — `Terminating` chip replaces stale Sync/Health badges; severity ramps with deletion age; mutating ops refuse on zombies
+- **Cross-linked from the rest of Radar** — `Managed by` chip in resource drawers, GitOps routing from Topology + Timeline + Helm view, `Consumed by` panel on Flux source CRs
+- **MCP integration** — `manage_gitops` exposes sync / suspend / resume / reconcile / rollback with lifecycle-aware refusal
+
+See the [GitOps guide](docs/gitops.md) for the full feature matrix, RBAC requirements, demo cluster, and single-cluster scope notes.
 
 ### Traffic
 
@@ -281,6 +314,21 @@ Proactive best-practices scanner with 31 checks across security, reliability, an
 - Framework labels: NSA/CISA, CIS benchmarks
 - MCP tool (`get_cluster_audit`) for AI-assisted cluster analysis
 
+### Access Control (RBAC visibility)
+
+Inspect what any ServiceAccount can actually do — without three `kubectl describe` calls.
+
+- **ServiceAccount detail**: direct bindings, effective permissions (per-binding and deduplicated flat view), inherited grants via implicit groups (`system:authenticated`, `system:serviceaccounts`), and "Used by Pods" closing the loop
+- **Pod detail**: "Permissions" section showing the most-permissive rules the Pod's SA grants, plus a blast-radius alert when the SA has wildcards, cluster-admin, escalation verbs, or cluster-wide `create pods`
+- **Workload detail** (Deployment / StatefulSet / DaemonSet): same Permissions section framed at the workload level — every Pod the workload spawns inherits these grants
+- **Namespace detail**: RBAC summary with RoleBindings configured here + ClusterRoleBindings whose subjects reference this namespace
+- **Role / ClusterRole detail**: who is bound to this role, with subject summaries inline
+- **RoleBinding detail**: inline preview of the rules the binding grants + warnings when subjects include wide groups (`system:authenticated`, `system:unauthenticated`, `system:masters`)
+- **"My Permissions" panel**: namespace-scoped live `SelfSubjectRulesReview` for the current user — for fast "why can't I do X" debugging
+- **MCP**: `get_subject_permissions` tool exposes the same data to AI assistants for "is this SA over-privileged?" / "blast radius if compromised?" queries
+
+Considered for follow-ups, deliberately not in this pass — RBAC audit checks (wildcard / cluster-admin / orphan-binding / unused-role detection, Kubescape-aligned), a verb × resource matrix view on the SA page (rakkess-style), a "Subject Explorer" top-level page for browsing Users / Groups without a detail page today, a graph topology view of Subject → Binding → Role → Rule (`rbac-tool viz` style), in-UI binding edits, and a "can-i" free-form query UI. Read-only visibility ships first; we'll come back once we see how operators use the reverse-lookup.
+
 ### AI Integration (MCP) <sup>beta</sup>
 
 Radar includes a built-in [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server that lets AI assistants — Claude, Cursor, Copilot, and others — query your cluster through Radar.
@@ -306,11 +354,13 @@ No auth by default (local use). See the **[Authentication Guide](docs/authentica
 
 Radar auto-discovers any CRD in your cluster. Popular tools get [dedicated integrations](docs/integrations.md) with topology edges, detail views, and AI summaries.
 
+**Default chart RBAC** covers the built-in Kubernetes kinds listed below — Workloads, Networking (including NetworkPolicies and PodDisruptionBudgets), Configuration, Storage (PersistentVolumes, PersistentVolumeClaims, StorageClasses), HorizontalPodAutoscalers, ServiceAccounts, LimitRanges, ResourceQuotas, Nodes, Namespaces, and Events. RBAC objects (Roles, ClusterRoles, RoleBindings, ClusterRoleBindings) are opt-in via `rbac.viewRBAC=true`. **CRD-based integrations** (Gateway API, VerticalPodAutoscaler, ArgoCD, FluxCD, cert-manager, etc.) need both the CRD installed in your cluster *and* read access granted — most groups are default-on under `rbac.crdGroups.<name>` (e.g. `gatewayApi`, `verticalPodAutoscaler`); check `values.yaml` or add custom rules via `rbac.additionalRules`.
+
 | Category | Resources |
 |----------|-----------|
 | **Workloads** | Deployments, DaemonSets, StatefulSets, ReplicaSets, Pods, Jobs, CronJobs |
-| **Networking** | Services, Ingresses, NetworkPolicies, Endpoints, PodDisruptionBudgets |
-| **Configuration** | ConfigMaps, Secrets (names only, values hidden) |
+| **Networking** | Services, Ingresses, NetworkPolicies, Endpoints, EndpointSlices, PodDisruptionBudgets |
+| **Configuration** | ConfigMaps, Secrets (names only, values hidden), LimitRanges, ResourceQuotas |
 | **Storage** | PersistentVolumeClaims, PersistentVolumes, StorageClasses |
 | **Autoscaling** | HorizontalPodAutoscalers, VerticalPodAutoscalers |
 | **Cluster** | Nodes, Namespaces, ServiceAccounts, Events |
@@ -335,6 +385,7 @@ Radar auto-discovers any CRD in your cluster. Popular tools get [dedicated integ
 | **Velero** | Backup, Restore, Schedule, BackupStorageLocation, VolumeSnapshotLocation |
 | **External Secrets** | ExternalSecret, ClusterExternalSecret, SecretStore, ClusterSecretStore |
 | **CloudNativePG** | Cluster, Backup, ScheduledBackup, Pooler |
+| **Crossplane** | Managed Resources (any provider), Composite Resources, Claims, Provider, ProviderConfig, Function, Configuration, Composition, CompositionRevision, XRD |
 | **Kyverno** | Policy, ClusterPolicy, PolicyReport, ClusterPolicyReport |
 | **Sealed Secrets** | SealedSecret |
 | **Cost (OpenCost)** | Namespace/workload/node cost breakdown via Prometheus (no CRDs) |

@@ -26,25 +26,31 @@ import (
 
 // AppConfig holds all parsed configuration for the Radar application.
 type AppConfig struct {
-	Kubeconfig       string
-	KubeconfigDirs   []string
-	Namespace        string
-	Port             int
-	NoBrowser        bool
-	DevMode          bool
-	HistoryLimit     int
-	DebugEvents      bool
-	FakeInCluster    bool
-	DisableHelmWrite bool
-	DisableExec          bool
-	DisableLocalTerminal bool
-	PodShellDefault      string
-	TimelineStorage      string
-	TimelineDBPath   string
-	PrometheusURL    string
-	Version          string
-	MCPEnabled       bool
-	AuthConfig       auth.Config
+	Kubeconfig               string
+	KubeconfigDirs           []string
+	Namespace                string
+	Port                     int
+	NoBrowser                bool
+	DevMode                  bool
+	HistoryLimit             int
+	DebugEvents              bool
+	FakeInCluster            bool
+	DisableHelmWrite         bool
+	DisableExec              bool
+	DisableLocalTerminal     bool
+	PodShellDefault          string
+	DebugImage               string
+	ListPageSize             int64
+	TimelineStorage          string
+	TimelineDBPath           string
+	TimelineRetention        time.Duration
+	TimelineMaxSizeBytes     int64
+	PrometheusURL            string
+	PrometheusHeaders        map[string]string
+	PrometheusHeadersFromEnv map[string]string
+	Version                  string
+	MCPEnabled               bool
+	AuthConfig               auth.Config
 }
 
 // SetGlobals applies debug/test flags to global state.
@@ -55,6 +61,7 @@ func SetGlobals(cfg AppConfig) {
 	k8s.ForceDisableHelmWrite = cfg.DisableHelmWrite
 	k8s.ForceDisableExec = cfg.DisableExec
 	k8s.ForceDisableLocalTerminal = cfg.DisableLocalTerminal
+	k8s.ListPageSize = cfg.ListPageSize
 	server.DefaultPodShellCommand = cfg.PodShellDefault
 	versionpkg.SetCurrent(cfg.Version)
 }
@@ -104,6 +111,8 @@ func BuildTimelineStoreConfig(cfg AppConfig) timeline.StoreConfig {
 			dbPath = filepath.Join(homeDir, ".radar", "timeline.db")
 		}
 		storeCfg.Path = dbPath
+		storeCfg.RetentionAge = cfg.TimelineRetention
+		storeCfg.MaxStorageBytes = cfg.TimelineMaxSizeBytes
 	}
 	return storeCfg
 }
@@ -129,6 +138,10 @@ func RegisterCallbacks(cfg AppConfig, timelineStoreCfg timeline.StoreConfig) {
 		traffic.SetMetricsURL(cfg.PrometheusURL)
 		prometheuspkg.SetManualURL(cfg.PrometheusURL)
 	}
+	if len(cfg.PrometheusHeaders) > 0 {
+		traffic.SetMetricsHeaders(cfg.PrometheusHeaders)
+		prometheuspkg.SetHeaders(cfg.PrometheusHeaders)
+	}
 
 	k8s.RegisterTrafficFuncs(traffic.Reset, func() error {
 		return traffic.ReinitializeWithConfig(k8s.GetClient(), k8s.GetConfig(), k8s.GetContextName())
@@ -139,6 +152,9 @@ func RegisterCallbacks(cfg AppConfig, timelineStoreCfg timeline.StoreConfig) {
 		if cfg.PrometheusURL != "" {
 			prometheuspkg.SetManualURL(cfg.PrometheusURL)
 		}
+		if len(cfg.PrometheusHeaders) > 0 {
+			prometheuspkg.SetHeaders(cfg.PrometheusHeaders)
+		}
 		return nil
 	})
 }
@@ -146,16 +162,20 @@ func RegisterCallbacks(cfg AppConfig, timelineStoreCfg timeline.StoreConfig) {
 // CreateServer creates the HTTP server with the given configuration.
 func CreateServer(cfg AppConfig) *server.Server {
 	effectiveCfg := &config.Config{
-		Kubeconfig:      cfg.Kubeconfig,
-		KubeconfigDirs:  cfg.KubeconfigDirs,
-		Namespace:       cfg.Namespace,
-		Port:            cfg.Port,
-		NoBrowser:       cfg.NoBrowser,
-		TimelineStorage: cfg.TimelineStorage,
-		TimelineDBPath:  cfg.TimelineDBPath,
-		HistoryLimit:    cfg.HistoryLimit,
-		PrometheusURL:   cfg.PrometheusURL,
-		MCP:             &cfg.MCPEnabled,
+		Kubeconfig:               cfg.Kubeconfig,
+		KubeconfigDirs:           cfg.KubeconfigDirs,
+		Namespace:                cfg.Namespace,
+		Port:                     cfg.Port,
+		NoBrowser:                cfg.NoBrowser,
+		TimelineStorage:          cfg.TimelineStorage,
+		TimelineDBPath:           cfg.TimelineDBPath,
+		TimelineMaxSize:          fmt.Sprintf("%d", cfg.TimelineMaxSizeBytes),
+		HistoryLimit:             cfg.HistoryLimit,
+		PrometheusURL:            cfg.PrometheusURL,
+		PrometheusHeaders:        cfg.PrometheusHeaders,
+		PrometheusHeadersFromEnv: cfg.PrometheusHeadersFromEnv,
+		DebugImage:               cfg.DebugImage,
+		MCP:                      &cfg.MCPEnabled,
 	}
 
 	serverCfg := server.Config{
@@ -165,14 +185,15 @@ func CreateServer(cfg AppConfig) *server.Server {
 		StaticRoot:      "dist",
 		EffectiveConfig: effectiveCfg,
 		DiagConfig: &server.DiagConfig{
-			Port:             cfg.Port,
-			DevMode:          cfg.DevMode,
-			Namespace:        cfg.Namespace,
-			TimelineStorage:  cfg.TimelineStorage,
-			HistoryLimit:     cfg.HistoryLimit,
-			DebugEvents:      cfg.DebugEvents,
-			MCPEnabled:       cfg.MCPEnabled,
-			HasPrometheusURL: cfg.PrometheusURL != "",
+			Port:                 cfg.Port,
+			DevMode:              cfg.DevMode,
+			Namespace:            cfg.Namespace,
+			TimelineStorage:      cfg.TimelineStorage,
+			HistoryLimit:         cfg.HistoryLimit,
+			DebugEvents:          cfg.DebugEvents,
+			MCPEnabled:           cfg.MCPEnabled,
+			HasPrometheusURL:     cfg.PrometheusURL != "",
+			HasPrometheusHeaders: len(cfg.PrometheusHeaders) > 0,
 		},
 		AuthConfig: cfg.AuthConfig,
 	}

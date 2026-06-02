@@ -4,6 +4,7 @@ import type { ResolvedEnvFrom } from '@skyhook-io/k8s-ui'
 import { useOpenTerminal, useOpenLogs } from '../../dock'
 import { useNamespacedCapabilities } from '../../../contexts/CapabilitiesContext'
 import { usePodMetrics, usePodMetricsHistory, usePrometheusResourceMetrics, usePrometheusStatus } from '../../../api/client'
+import { useRBACSubject } from '../../../api/rbac'
 import { PortForwardInlineButton } from '../../portforward/PortForwardButton'
 import { ImageFilesystemModal } from '../ImageFilesystemModal'
 import { PodFilesystemModal } from '../PodFilesystemModal'
@@ -42,6 +43,15 @@ export function PodRenderer({ data, onCopy, copied, onNavigate, onOpenLogs, reso
   ) ?? false)
   const hideMetricsServer = prometheusHasCPU || (prometheusConnected && prometheusCPULoading)
 
+  // RBAC reverse-lookup for the Pod's ServiceAccount. Defaults to "default" —
+  // that's the SA every Pod uses when spec.serviceAccountName is unset, which
+  // is itself a useful signal (operators often don't realize "default" still
+  // has whatever permissions the namespace's defaults grant).
+  const saName = data.spec?.serviceAccountName || 'default'
+  const { data: rbacData, isLoading: rbacLoading, error: rbacError } = useRBACSubject(
+    'ServiceAccount', namespace ?? '', saName, !!namespace,
+  )
+
   return (
     <BasePodRenderer
       data={data}
@@ -50,6 +60,9 @@ export function PodRenderer({ data, onCopy, copied, onNavigate, onOpenLogs, reso
       onNavigate={onNavigate}
       onOpenLogs={onOpenLogs}
       resolvedEnvFrom={resolvedEnvFrom}
+      rbacData={rbacData ?? null}
+      rbacLoading={rbacLoading}
+      rbacError={rbacError as Error | null}
       canExec={canExec}
       canViewLogs={canViewLogs}
       canPortForward={canPortForward}

@@ -5,7 +5,7 @@ import {
   ChevronUp,
 } from 'lucide-react'
 import { clsx } from 'clsx'
-import type { NodeKind, HealthStatus } from '../../types'
+import type { NodeKind, HealthStatus, PodSummary } from '../../types'
 import { displayKind } from '../../types'
 import { healthToSeverity, SEVERITY_DOT } from '../../utils/badge-colors'
 import { Tooltip } from '../ui/Tooltip'
@@ -43,12 +43,62 @@ function getIssueTooltip(issue: string | undefined): React.ReactNode {
     Pending: {
       title: 'Pending',
       description: 'Pod is waiting to be scheduled to a node.',
-      action: 'Check for resource constraints or node availability.',
+      action: 'Open the pod to see the scheduler verdict (taints, resources, affinity).',
     },
     FailedScheduling: {
       title: 'Scheduling Failed',
       description: 'No suitable node found for this pod.',
       action: 'Check node resources, taints, tolerations, and affinity rules.',
+    },
+    Unschedulable: {
+      title: 'Unschedulable',
+      description: 'The scheduler tried every node and none fit.',
+      action: 'Open the pod for the decomposed reason — arch/OS mismatch, untolerated taint, insufficient resources, or affinity.',
+    },
+    QuotaExceeded: {
+      title: 'ResourceQuota Exceeded',
+      description: 'A namespace ResourceQuota is at its hard limit, so new pods are rejected at admission.',
+      action: 'Open the namespace to see quota usage; raise the quota or free usage.',
+    },
+    QuotaNearLimit: {
+      title: 'ResourceQuota Near Limit',
+      description: 'A namespace ResourceQuota is close to its hard limit and will soon block new pods.',
+      action: 'Open the namespace to see quota usage.',
+    },
+    IPExhaustion: {
+      title: 'IP Exhaustion (CNI)',
+      description: 'The pod was scheduled but the CNI could not assign an IP — the node/subnet pool is exhausted.',
+      action: 'Free IPs, scale the subnet/ENI pool, or move the pod to a node with capacity.',
+    },
+    SandboxCreationFailed: {
+      title: 'Sandbox Creation Failed',
+      description: 'The kubelet could not create the pod sandbox.',
+      action: 'Check kubelet/CNI events on the node.',
+    },
+    VolumeMount: {
+      title: 'Volume Mount Failed',
+      description: 'The pod was scheduled but a volume could not be mounted.',
+      action: 'Check the PVC/PV binding and the CSI driver on the node.',
+    },
+    VolumeAttach: {
+      title: 'Volume Attach Failed',
+      description: 'A volume could not be attached to the node.',
+      action: 'Check the CSI driver and cloud-provider attach limits.',
+    },
+    VolumeMultiAttach: {
+      title: 'Volume Multi-Attach',
+      description: 'The volume is still attached to another node — a RWO volume cannot attach in two places.',
+      action: 'Wait for the old pod to terminate, or cordon/drain the stale node.',
+    },
+    PodSecurityViolation: {
+      title: 'Pod Security Violation',
+      description: 'Pod Security Admission rejected the pod template at admission.',
+      action: 'Align the pod securityContext with the namespace PSA level.',
+    },
+    WebhookDenied: {
+      title: 'Admission Webhook Denied',
+      description: 'A validating/mutating admission webhook rejected pod creation.',
+      action: 'Check the webhook policy that denied the request.',
     },
     Evicted: {
       title: 'Pod Evicted',
@@ -79,70 +129,70 @@ function getIssueTooltip(issue: string | undefined): React.ReactNode {
 }
 
 // Default dimensions for unknown CRD kinds
-export const DEFAULT_NODE_DIMENSIONS = { width: 260, height: 56 }
+export const DEFAULT_NODE_DIMENSIONS = { width: 260, height: 84 }
 
 // Node dimensions for ELK layout - sized for typical K8s resource names
 export const NODE_DIMENSIONS: Record<NodeKind, { width: number; height: number }> = {
   Internet: { width: 120, height: 52 },
-  Ingress: { width: 300, height: 56 },
-  Gateway: { width: 300, height: 56 },
-  HTTPRoute: { width: 300, height: 56 },
-  GRPCRoute: { width: 300, height: 56 },
-  TCPRoute: { width: 300, height: 56 },
-  TLSRoute: { width: 300, height: 56 },
-  Service: { width: 260, height: 56 },
-  Deployment: { width: 280, height: 56 },
-  Rollout: { width: 280, height: 56 },
-  Application: { width: 300, height: 56 }, // ArgoCD Application
-  Kustomization: { width: 300, height: 56 }, // FluxCD Kustomization
-  HelmRelease: { width: 280, height: 56 }, // FluxCD HelmRelease
-  GitRepository: { width: 280, height: 56 }, // FluxCD GitRepository
-  DaemonSet: { width: 280, height: 56 },
-  StatefulSet: { width: 280, height: 56 },
-  ReplicaSet: { width: 280, height: 56 },
-  Pod: { width: 300, height: 56 },
+  Ingress: { width: 300, height: 84 },
+  Gateway: { width: 300, height: 84 },
+  HTTPRoute: { width: 300, height: 84 },
+  GRPCRoute: { width: 300, height: 84 },
+  TCPRoute: { width: 300, height: 84 },
+  TLSRoute: { width: 300, height: 84 },
+  Service: { width: 260, height: 84 },
+  Deployment: { width: 280, height: 84 },
+  Rollout: { width: 280, height: 84 },
+  Application: { width: 300, height: 84 }, // ArgoCD Application
+  Kustomization: { width: 300, height: 84 }, // FluxCD Kustomization
+  HelmRelease: { width: 280, height: 84 }, // FluxCD HelmRelease
+  GitRepository: { width: 280, height: 84 }, // FluxCD GitRepository
+  DaemonSet: { width: 280, height: 84 },
+  StatefulSet: { width: 280, height: 84 },
+  ReplicaSet: { width: 280, height: 84 },
+  Pod: { width: 300, height: 84 },
   PodGroup: { width: 200, height: 64 },
-  ConfigMap: { width: 180, height: 48 },
-  Secret: { width: 180, height: 48 },
-  HorizontalPodAutoscaler: { width: 280, height: 56 },
-  Job: { width: 180, height: 56 },
-  CronJob: { width: 200, height: 56 },
-  PersistentVolumeClaim: { width: 200, height: 48 },
-  Namespace: { width: 180, height: 48 },
-  Node: { width: 280, height: 56 },
-  NodePool: { width: 260, height: 56 },
-  NodeClaim: { width: 260, height: 56 },
-  NodeClass: { width: 260, height: 56 },
-  KnativeService: { width: 280, height: 56 },
-  KnativeConfiguration: { width: 280, height: 56 },
-  KnativeRevision: { width: 280, height: 56 },
-  KnativeRoute: { width: 280, height: 56 },
-  Broker: { width: 280, height: 56 },
-  Channel: { width: 280, height: 56 },
-  Trigger: { width: 280, height: 56 },
-  PingSource: { width: 280, height: 56 },
-  ApiServerSource: { width: 280, height: 56 },
-  ContainerSource: { width: 280, height: 56 },
-  SinkBinding: { width: 280, height: 56 },
-  IngressRoute: { width: 280, height: 56 },
-  IngressRouteTCP: { width: 280, height: 56 },
-  IngressRouteUDP: { width: 280, height: 56 },
-  Middleware: { width: 280, height: 56 },
-  MiddlewareTCP: { width: 280, height: 56 },
-  TraefikService: { width: 280, height: 56 },
-  ServersTransport: { width: 280, height: 56 },
-  ServersTransportTCP: { width: 300, height: 56 },
-  TLSOption: { width: 280, height: 56 },
-  TLSStore: { width: 280, height: 56 },
-  HTTPProxy: { width: 280, height: 56 }, // Contour
-  CAPICluster: { width: 280, height: 56 }, // Cluster API
-  MachineDeployment: { width: 300, height: 56 },
-  MachineSet: { width: 280, height: 56 },
-  Machine: { width: 260, height: 56 },
-  MachinePool: { width: 280, height: 56 },
-  KubeadmControlPlane: { width: 300, height: 56 },
-  ClusterClass: { width: 280, height: 56 },
-  MachineHealthCheck: { width: 300, height: 56 },
+  ConfigMap: { width: 180, height: 84 },
+  Secret: { width: 180, height: 84 },
+  HorizontalPodAutoscaler: { width: 280, height: 84 },
+  Job: { width: 180, height: 84 },
+  CronJob: { width: 200, height: 84 },
+  PersistentVolumeClaim: { width: 200, height: 84 },
+  Namespace: { width: 180, height: 84 },
+  Node: { width: 280, height: 84 },
+  NodePool: { width: 260, height: 84 },
+  NodeClaim: { width: 260, height: 84 },
+  NodeClass: { width: 260, height: 84 },
+  KnativeService: { width: 280, height: 84 },
+  KnativeConfiguration: { width: 280, height: 84 },
+  KnativeRevision: { width: 280, height: 84 },
+  KnativeRoute: { width: 280, height: 84 },
+  Broker: { width: 280, height: 84 },
+  Channel: { width: 280, height: 84 },
+  Trigger: { width: 280, height: 84 },
+  PingSource: { width: 280, height: 84 },
+  ApiServerSource: { width: 280, height: 84 },
+  ContainerSource: { width: 280, height: 84 },
+  SinkBinding: { width: 280, height: 84 },
+  IngressRoute: { width: 280, height: 84 },
+  IngressRouteTCP: { width: 280, height: 84 },
+  IngressRouteUDP: { width: 280, height: 84 },
+  Middleware: { width: 280, height: 84 },
+  MiddlewareTCP: { width: 280, height: 84 },
+  TraefikService: { width: 280, height: 84 },
+  ServersTransport: { width: 280, height: 84 },
+  ServersTransportTCP: { width: 300, height: 84 },
+  TLSOption: { width: 280, height: 84 },
+  TLSStore: { width: 280, height: 84 },
+  HTTPProxy: { width: 280, height: 84 }, // Contour
+  CAPICluster: { width: 280, height: 84 }, // Cluster API
+  MachineDeployment: { width: 300, height: 84 },
+  MachineSet: { width: 280, height: 84 },
+  Machine: { width: 260, height: 84 },
+  MachinePool: { width: 280, height: 84 },
+  KubeadmControlPlane: { width: 300, height: 84 },
+  ClusterClass: { width: 280, height: 84 },
+  MachineHealthCheck: { width: 300, height: 84 },
 }
 
 
@@ -171,8 +221,27 @@ function getStatusStyle(status: HealthStatus): React.CSSProperties {
 }
 
 
-// Format subtitle based on node kind
+// Format subtitle based on node kind. In summary mode the pod tier is
+// collapsed, so workload/service nodes carry a podSummary — append it so the
+// count of pods (and any unhealthy/pending) is still visible without children.
 function getSubtitle(kind: NodeKind, nodeData: Record<string, unknown>): string {
+  const base = baseSubtitle(kind, nodeData)
+  const ps = nodeData.podSummary as PodSummary | undefined
+  if (ps && SUMMARY_POD_KINDS.has(kind)) {
+    let suffix = `${ps.total} pods`
+    if (ps.unhealthy > 0) suffix += ` (${ps.unhealthy} unhealthy)`
+    else if (ps.degraded > 0) suffix += ` (${ps.degraded} pending)`
+    return base ? `${base} • ${suffix}` : suffix
+  }
+  return base
+}
+
+// Kinds that own pods and therefore carry a podSummary in summary mode.
+const SUMMARY_POD_KINDS = new Set<NodeKind>([
+  'Deployment', 'StatefulSet', 'DaemonSet', 'Rollout', 'Job', 'Service',
+])
+
+function baseSubtitle(kind: NodeKind, nodeData: Record<string, unknown>): string {
   switch (kind) {
     case 'Deployment':
     case 'Rollout':
@@ -356,7 +425,7 @@ export const K8sResourceNode = memo(function K8sResourceNode({
         className={clsx(
           'relative rounded-lg overflow-hidden',
           'bg-theme-surface topology-node-card',
-          selected && 'ring-2 ring-skyhook-400',
+          selected && 'topology-node-selected',
           isSmallNode && 'opacity-90',
           // Status bar via CSS pseudo-element (defined in index.css)
           (status === 'healthy' || status === 'unknown') && 'topology-node-status-bar',

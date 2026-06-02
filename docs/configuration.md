@@ -19,9 +19,12 @@ Persistent defaults for CLI flags. CLI flags always override these values. Manag
   "noBrowser": false,
   "timelineStorage": "memory",
   "timelineDbPath": "~/.radar/timeline.db",
+  "timelineMaxSize": "0",
   "historyLimit": 10000,
   "prometheusUrl": "",
-  "mcp": true
+  "prometheusHeaders": {},
+  "mcp": true,
+  "debugImage": ""
 }
 ```
 
@@ -36,9 +39,13 @@ All fields are optional — omitted fields use built-in defaults.
 | `noBrowser` | Don't auto-open browser |
 | `timelineStorage` | `memory` or `sqlite` |
 | `timelineDbPath` | Path to SQLite database |
+| `timelineMaxSize` | Max SQLite DB + WAL size before pruning oldest events (`0` disables) |
 | `historyLimit` | Max timeline events to retain |
 | `prometheusUrl` | Manual Prometheus/VictoriaMetrics URL — skips auto-discovery. Useful when Prometheus is not in the same cluster or uses a non-standard service name. |
+| `prometheusHeaders` | HTTP headers sent with every Prometheus request. Required for auth-protected backends — e.g. `{"X-Scope-OrgID": "my-org"}`. Equivalent CLI: `--prometheus-header Key=Value` (repeatable). Stored in plain text in `config.json` — protect the file accordingly. |
+| `prometheusHeadersFromEnv` | Header values read from environment variables at startup — e.g. `{"Authorization": "PROMETHEUS_TOKEN"}`. Equivalent CLI: `--prometheus-header-from-env Key=ENV_VAR` (repeatable). Use this with Kubernetes Secret-backed env vars in Helm deployments. |
 | `mcp` | Enable/disable MCP server for AI tools (default: enabled) |
+| `debugImage` | Image for ephemeral debug containers and node debug pods (same as `--debug-image`). Empty = `busybox:latest`; point at a mirror for air-gapped / private-registry clusters. |
 
 ### Settings File (`~/.radar/settings.json`)
 
@@ -108,6 +115,12 @@ kubectl radar --kubeconfig-dir ~/.kube/configs/
 Radar supports switching between Kubernetes contexts at runtime through the UI. Click the context selector in the header to switch between available contexts.
 
 When running in-cluster (using the pod's service account), context switching is disabled.
+
+## Namespace Picker
+
+The header has a namespace picker on the right. Pick a single namespace to focus the view, or **All namespaces** to see everything you have access to. Cluster-scoped resources (Nodes, Namespaces, PVs, StorageClasses) appear regardless of the pick if your RBAC permits them — they have no namespace to filter on. Namespace-restricted users without their own cluster-scoped RBAC won't see cluster-scoped sections at all.
+
+The pick is a per-user view filter — it doesn't change anything for other users sharing the same Radar instance. Locally, your pick is remembered per kubeconfig context across restarts. In shared (auth-enabled) deployments the pick lives for the session.
 
 ## Related Documentation
 

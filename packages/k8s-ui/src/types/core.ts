@@ -1,6 +1,8 @@
 // Topology types matching the Go backend
 
-// Per-resource-type RBAC permissions (matches backend k8s.ResourcePermissions)
+// Per-resource-type RBAC permissions. Field names must match the JSON keys
+// produced by ResourcePermissions in internal/k8s/capabilities.go — there
+// is no automated check across the Go/TS boundary.
 export interface ResourcePermissions {
   pods: boolean
   services: boolean
@@ -12,15 +14,38 @@ export interface ResourcePermissions {
   configMaps: boolean
   secrets: boolean
   events: boolean
-  pvcs: boolean
+  persistentVolumeClaims: boolean
   nodes: boolean
   namespaces: boolean
   jobs: boolean
   cronJobs: boolean
-  hpas: boolean
+  horizontalPodAutoscalers: boolean
+  persistentVolumes: boolean
+  storageClasses: boolean
+  podDisruptionBudgets: boolean
+  networkPolicies: boolean
+  serviceAccounts: boolean
+  roles: boolean
+  clusterRoles: boolean
+  roleBindings: boolean
+  clusterRoleBindings: boolean
+  limitRanges: boolean
   gateways: boolean
   httpRoutes: boolean
+  verticalPodAutoscalers: boolean
 }
+
+// Keys in ResourcePermissions that represent optional CRDs Radar can monitor
+// when they're installed in the cluster. A `false` here means "CRD not
+// installed (or RBAC denied)" — NOT "Radar is missing data the user expects",
+// so banners about RBAC restrictions should ignore these keys.
+//
+// Keep in sync with dynamicCapabilityKinds in internal/k8s/capabilities_alignment_test.go.
+export const OPTIONAL_RESOURCE_KINDS: ReadonlyArray<keyof ResourcePermissions> = [
+  'gateways',
+  'httpRoutes',
+  'verticalPodAutoscalers',
+]
 
 // Feature capabilities based on RBAC permissions
 export interface Capabilities {
@@ -187,7 +212,17 @@ export interface Topology {
   largeCluster?: boolean // True if cluster exceeds large cluster threshold
   hiddenKinds?: string[] // Resource kinds auto-hidden for performance
   requiresNamespaceFilter?: boolean // True if cluster is too large for all-namespace topology
+  estimatedNodes?: number // Pre-build node count estimate
+  summaryMode?: boolean // True when the pod tier was collapsed into per-workload/service counts
   crdDiscoveryStatus?: 'idle' | 'discovering' | 'ready' // CRD discovery status
+}
+
+// PodSummary is stamped onto a workload or service node's data in summary mode.
+export interface PodSummary {
+  total: number
+  healthy: number
+  degraded: number
+  unhealthy: number
 }
 
 // K8s Event (from SSE stream)
@@ -233,6 +268,7 @@ export interface TimelineEvent {
 
   // Resource identity
   kind: string
+  apiVersion?: string // e.g. "apps/v1", "cluster.x-k8s.io/v1beta1"
   namespace: string
   name: string
   uid?: string
@@ -375,7 +411,8 @@ export interface ResolvedEnvFromEntry {
   values: Record<string, string>
   isSecret: boolean
 }
-export type ResolvedEnvFrom = Record<string, ResolvedEnvFromEntry>
+export type ResolvedEnvFromKey = `configmap:${string}` | `secret:${string}`
+export type ResolvedEnvFrom = Partial<Record<ResolvedEnvFromKey, ResolvedEnvFromEntry>>
 
 // Resource reference (for relationships)
 export interface ResourceRef {
@@ -389,6 +426,7 @@ export interface ResourceRef {
 export interface Relationships {
   owner?: ResourceRef
   deployment?: ResourceRef   // Grandparent Deployment (for Pods owned by ReplicaSets)
+  managedBy?: ResourceRef[]  // Topmost meaningful manager(s): GitOps controller (ArgoCD Application / Flux Kustomization / Flux HelmRelease), Helm release, or the topmost K8s owner. Synthesized server-side; replaces client-side detectGitOpsOwner.
   children?: ResourceRef[]
   services?: ResourceRef[]
   ingresses?: ResourceRef[]
@@ -398,8 +436,11 @@ export interface Relationships {
   consumers?: ResourceRef[]
   scalers?: ResourceRef[]
   scaleTarget?: ResourceRef
-  policies?: ResourceRef[]
+  pdbs?: ResourceRef[]              // PodDisruptionBudgets protecting this workload
+  networkPolicies?: ResourceRef[]   // NetworkPolicy / CiliumNetworkPolicy / ClusterNetworkPolicy variants selecting this workload
   pods?: ResourceRef[]
+  serviceAccount?: ResourceRef      // For Pods: derived from pod.spec.serviceAccountName
+  node?: ResourceRef                // For scheduled Pods: derived from pod.spec.nodeName
 }
 
 // Parsed X.509 certificate metadata (from backend cert parsing)
@@ -454,6 +495,11 @@ export interface HelmRelease {
   resourceHealth?: 'healthy' | 'degraded' | 'unhealthy' | 'unknown'
   healthIssue?: string    // Primary issue if unhealthy (e.g., "OOMKilled")
   healthSummary?: string  // Brief summary like "2/3 pods ready"
+  // When set, this release was installed by Flux's helm-controller — the
+  // user should manage it via the named HelmRelease CR (GitOps tab) rather
+  // than helm CLI / Radar's Helm view, since changes here would get
+  // reverted at the next reconcile. Format: "namespace/name".
+  managedByFluxHelmRelease?: string
 }
 
 export interface HelmRevision {
@@ -483,6 +529,9 @@ export interface HelmReleaseDetail {
   hooks?: HelmHook[]
   readme?: string
   dependencies?: ChartDependency[]
+  // When set, this release was installed by Flux's helm-controller — see
+  // HelmRelease.managedByFluxHelmRelease for context. Format: "namespace/name".
+  managedByFluxHelmRelease?: string
 }
 
 export interface HelmHook {
@@ -503,6 +552,7 @@ export interface ChartDependency {
 
 export interface HelmOwnedResource {
   kind: string
+  apiVersion?: string // e.g. "apps/v1", "cluster.x-k8s.io/v1beta1"
   name: string
   namespace: string
   status?: string   // Running, Pending, Failed, Active, etc.
@@ -886,8 +936,11 @@ export interface TrafficFilters {
   timeRange: string
 }
 
-// Main view type now includes 'traffic' and 'cost'
-export type ExtendedMainView = MainView | 'traffic' | 'cost' | 'audit'
+// Main view type now includes 'traffic', 'cost', 'audit', 'gitops'.
+// Library consumers (Radar Hub) get all GitOps surfaces — the package
+// IS the public surface, so adding new top-level views must extend
+// this type rather than rely on app-local extensions.
+export type ExtendedMainView = MainView | 'traffic' | 'cost' | 'audit' | 'gitops' | 'issues'
 
 // ============================================================================
 // Image Filesystem Types

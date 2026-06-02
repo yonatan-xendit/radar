@@ -519,7 +519,7 @@ export function PodTemplateSection({ template }: { template: any }) {
           <div className="text-xs text-theme-text-secondary truncate" title={c.image}>{c.image}</div>
           {c.ports && (
             <div className="text-xs text-theme-text-tertiary mt-1">
-              Ports: {c.ports.map((p: any) => `${p.containerPort}/${p.protocol || 'TCP'}`).join(', ')}
+              Ports: {c.ports.map((p: any) => `${p.name ? `${p.name}: ` : ''}${p.containerPort}/${p.protocol || 'TCP'}`).join(', ')}
             </div>
           )}
         </div>
@@ -657,7 +657,7 @@ export function formatKindName(kind: string): string {
   const k = kind.toLowerCase()
   const names: Record<string, string> = {
     pods: 'Pod', deployments: 'Deployment', daemonsets: 'DaemonSet', statefulsets: 'StatefulSet',
-    replicasets: 'ReplicaSet', services: 'Service', ingresses: 'Ingress',
+    replicasets: 'ReplicaSet', services: 'Service', endpointslices: 'EndpointSlice', ingresses: 'Ingress',
     gateways: 'Gateway', httproutes: 'HTTPRoute', grpcroutes: 'GRPCRoute',
     tcproutes: 'TCPRoute', tlsroutes: 'TLSRoute', configmaps: 'ConfigMap',
     secrets: 'Secret', jobs: 'Job', cronjobs: 'CronJob', hpas: 'HPA',
@@ -724,7 +724,8 @@ export function RelatedResourcesSection({ relationships, onNavigate }: RelatedRe
     (relationships.configRefs && relationships.configRefs.length > 0) ||
     (relationships.consumers && relationships.consumers.length > 0) ||
     (relationships.scalers && relationships.scalers.length > 0) ||
-    (relationships.policies && relationships.policies.length > 0) ||
+    (relationships.pdbs && relationships.pdbs.length > 0) ||
+    (relationships.networkPolicies && relationships.networkPolicies.length > 0) ||
     relationships.scaleTarget
 
   if (!hasRelationships) return null
@@ -765,25 +766,12 @@ export function RelatedResourcesSection({ relationships, onNavigate }: RelatedRe
         {relationships.scalers && relationships.scalers.length > 0 && (
           <RelationshipGroup label="Autoscaler" refs={dedupeRefs(relationships.scalers)} onNavigate={onNavigate} />
         )}
-        {relationships.policies && relationships.policies.length > 0 && (() => {
-          const policyKinds = new Set(['NetworkPolicy', 'CiliumNetworkPolicy', 'CiliumClusterwideNetworkPolicy', 'ClusterNetworkPolicy'])
-          const pdbs = relationships.policies.filter(r => r.kind === 'PodDisruptionBudget')
-          const netpols = relationships.policies.filter(r => policyKinds.has(r.kind))
-          const other = relationships.policies.filter(r => r.kind !== 'PodDisruptionBudget' && !policyKinds.has(r.kind))
-          return (
-            <>
-              {pdbs.length > 0 && (
-                <RelationshipGroup label="Disruption Budget" refs={dedupeRefs(pdbs)} onNavigate={onNavigate} />
-              )}
-              {netpols.length > 0 && (
-                <RelationshipGroup label="Network Policies" refs={dedupeRefs(netpols)} onNavigate={onNavigate} />
-              )}
-              {other.length > 0 && (
-                <RelationshipGroup label="Policies" refs={dedupeRefs(other)} onNavigate={onNavigate} />
-              )}
-            </>
-          )
-        })()}
+        {relationships.pdbs && relationships.pdbs.length > 0 && (
+          <RelationshipGroup label="Disruption Budget" refs={dedupeRefs(relationships.pdbs)} onNavigate={onNavigate} />
+        )}
+        {relationships.networkPolicies && relationships.networkPolicies.length > 0 && (
+          <RelationshipGroup label="Network Policies" refs={dedupeRefs(relationships.networkPolicies)} onNavigate={onNavigate} />
+        )}
         {relationships.scaleTarget && (
           <RelationshipGroup label="Scale Target" refs={[relationships.scaleTarget]} onNavigate={onNavigate} />
         )}

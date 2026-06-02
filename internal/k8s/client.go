@@ -1,6 +1,7 @@
 package k8s
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -12,6 +13,8 @@ import (
 	"sync"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
@@ -24,15 +27,15 @@ import (
 )
 
 var (
-	k8sClient          *kubernetes.Clientset
-	k8sConfig          *rest.Config
-	discoveryClient    *discovery.DiscoveryClient
-	dynamicClient      dynamic.Interface
-	initOnce           sync.Once
-	initErr            error
-	kubeconfigPath     string
-	kubeconfigPaths    []string // Multiple kubeconfig paths when using --kubeconfig-dir or KUBECONFIG env
-	kubeconfigMode     string   // One of: "in-cluster", "single", "multi-env", "multi-dir"
+	k8sClient         *kubernetes.Clientset
+	k8sConfig         *rest.Config
+	discoveryClient   *discovery.DiscoveryClient
+	dynamicClient     dynamic.Interface
+	initOnce          sync.Once
+	initErr           error
+	kubeconfigPath    string
+	kubeconfigPaths   []string // Multiple kubeconfig paths when using --kubeconfig-dir or KUBECONFIG env
+	kubeconfigMode    string   // One of: "in-cluster", "single", "multi-env", "multi-dir"
 	totalContextCount int      // Total number of contexts exposed across all kubeconfig files
 	// contextRegistry maps each user-facing context name to its source file and
 	// the name it has inside that file. Populated when Radar loads more than one
@@ -51,7 +54,7 @@ var (
 	// destroyed clusters / removed contexts linger in the dropdown
 	// (they only error out when the user tries to switch to them).
 	// Same lifecycle / lock as perFileConfigs.
-	perFileMtimes     map[string]time.Time
+	perFileMtimes           map[string]time.Time
 	contextName       string
 	clusterName       string
 	contextNamespace  string // Default namespace from kubeconfig context
@@ -658,7 +661,7 @@ func SetFallbackNamespace(ns string) {
 }
 
 // GetEffectiveNamespace returns the namespace to use for RBAC fallback checks.
-// Prefers the kubeconfig context namespace, falls back to the explicit --namespace flag.
+// Precedence: kubeconfig context namespace > --namespace flag.
 func GetEffectiveNamespace() string {
 	clientMu.RLock()
 	defer clientMu.RUnlock()
@@ -666,6 +669,64 @@ func GetEffectiveNamespace() string {
 		return contextNamespace
 	}
 	return fallbackNamespace
+}
+
+// HasNamespaceFallback reports whether the current kubeconfig/context provides
+// a namespace fallback (kubeconfig context namespace or --namespace flag).
+func HasNamespaceFallback() bool {
+	clientMu.RLock()
+	defer clientMu.RUnlock()
+	return contextNamespace != "" || fallbackNamespace != ""
+}
+
+// GetAccessibleNamespaces returns the list of namespaces the user has
+// access to plus a flag indicating whether the list is authoritative.
+//
+//   - If the cluster-wide `list namespaces` succeeds (cluster-wide read),
+//     returns every namespace and authoritative=true.
+//   - On 403/401 the user is namespace-restricted; returns a best-effort
+//     short list (kubeconfig context namespace + --namespace flag, deduped)
+//     and authoritative=false.
+//   - On any other (transient) error, returns the same best-effort list
+//     with authoritative=false AND logs the error so a flapping apiserver
+//     surfaces in diagnostics rather than silently degrading the UI.
+func GetAccessibleNamespaces(ctx context.Context) ([]string, bool) {
+	client := GetClient()
+	if client == nil {
+		return nil, false
+	}
+
+	listCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	list, err := client.CoreV1().Namespaces().List(listCtx, metav1.ListOptions{})
+	if err == nil {
+		names := make([]string, 0, len(list.Items))
+		for _, ns := range list.Items {
+			names = append(names, ns.Name)
+		}
+		sort.Strings(names)
+		return names, true
+	}
+
+	if !apierrors.IsForbidden(err) && !apierrors.IsUnauthorized(err) {
+		log.Printf("[k8s] GetAccessibleNamespaces: non-auth error listing namespaces: %v (falling back to best-effort short list)", err)
+	}
+
+	// Cluster-wide list denied (or transient). Best-effort fallback so
+	// the picker isn't empty for a namespace-scoped user.
+	seen := map[string]bool{}
+	var fallback []string
+	clientMu.RLock()
+	for _, ns := range []string{contextNamespace, fallbackNamespace} {
+		if ns != "" && !seen[ns] {
+			seen[ns] = true
+			fallback = append(fallback, ns)
+		}
+	}
+	clientMu.RUnlock()
+	sort.Strings(fallback)
+	return fallback, false
 }
 
 // ForceInCluster overrides in-cluster detection for testing

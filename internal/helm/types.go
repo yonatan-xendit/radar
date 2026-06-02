@@ -20,6 +20,13 @@ type HelmRelease struct {
 	ResourceHealth string `json:"resourceHealth,omitempty"` // healthy, degraded, unhealthy, unknown
 	HealthIssue    string `json:"healthIssue,omitempty"`    // Primary issue if unhealthy (e.g., "OOMKilled")
 	HealthSummary  string `json:"healthSummary,omitempty"`  // Brief summary like "2/3 pods ready"
+	// ManagedByFluxHelmRelease names the Flux HelmRelease CR that owns this
+	// release when Flux's helm-controller installed it. Empty for releases
+	// installed via the helm CLI or other tools. Surfaces a "Managed by Flux"
+	// affordance in the UI so the user goes to GitOps to manage (changing
+	// values via `helm upgrade` here would get reverted on the next
+	// reconciliation). Format: "namespace/name".
+	ManagedByFluxHelmRelease string `json:"managedByFluxHelmRelease,omitempty"`
 }
 
 // HelmRevision represents a single revision in the release history
@@ -51,6 +58,8 @@ type HelmReleaseDetail struct {
 	Hooks            []HelmHook        `json:"hooks,omitempty"`
 	Readme           string            `json:"readme,omitempty"`
 	Dependencies     []ChartDependency `json:"dependencies,omitempty"`
+	// See HelmRelease.ManagedByFluxHelmRelease.
+	ManagedByFluxHelmRelease string `json:"managedByFluxHelmRelease,omitempty"`
 }
 
 // HelmHook represents a Helm hook (pre/post install, upgrade, etc.)
@@ -73,14 +82,15 @@ type ChartDependency struct {
 
 // OwnedResource represents a K8s resource created by a Helm release
 type OwnedResource struct {
-	Kind      string `json:"kind"`
-	Name      string `json:"name"`
-	Namespace string `json:"namespace"`
-	Status    string `json:"status,omitempty"`  // Running, Pending, Failed, etc.
-	Ready     string `json:"ready,omitempty"`   // e.g., "3/3" for deployments
-	Message   string `json:"message,omitempty"` // Status message or reason
-	Summary   string `json:"summary,omitempty"` // Brief status like "0/3 OOMKilled"
-	Issue     string `json:"issue,omitempty"`   // Primary issue if unhealthy
+	Kind       string `json:"kind"`
+	APIVersion string `json:"apiVersion,omitempty"` // e.g. "apps/v1", "cluster.x-k8s.io/v1beta1" — disambiguates CRD kind collisions on navigation
+	Name       string `json:"name"`
+	Namespace  string `json:"namespace"`
+	Status     string `json:"status,omitempty"`  // Running, Pending, Failed, etc.
+	Ready      string `json:"ready,omitempty"`   // e.g., "3/3" for deployments
+	Message    string `json:"message,omitempty"` // Status message or reason
+	Summary    string `json:"summary,omitempty"` // Brief status like "0/3 OOMKilled"
+	Issue      string `json:"issue,omitempty"`   // Primary issue if unhealthy
 }
 
 // HelmValues represents the values for a release

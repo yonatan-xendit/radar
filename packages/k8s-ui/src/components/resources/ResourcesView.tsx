@@ -22,10 +22,13 @@ import {
   Copy,
   Check,
   Plus,
+  GitCompare,
+  Regex,
 } from 'lucide-react'
 import { clsx } from 'clsx'
 import { ResourceBar } from '../ui/ResourceBar'
 import type { SelectedResource, APIResource } from '../../types'
+import { isForbiddenError } from '../../types/fetch-error'
 import type { NavigateToResource } from '../../utils/navigation'
 import { categorizeResources, CORE_RESOURCES } from '../../utils/api-resources'
 import {
@@ -137,6 +140,8 @@ import { PolicyReportCell, ClusterPolicyReportCell, KyvernoPolicyCell, ClusterPo
 import { ExternalSecretCell, ClusterExternalSecretCell, SecretStoreCell, ClusterSecretStoreCell } from './renderers/eso-cells'
 import { BackupCell, RestoreCell, ScheduleCell, BackupStorageLocationCell } from './renderers/velero-cells'
 import { CNPGClusterCell, CNPGBackupCell, CNPGScheduledBackupCell, CNPGPoolerCell } from './renderers/cnpg-cells'
+import { ManagedResourceCell, CompositeResourceCell, CrossplaneProviderCell, CrossplaneProviderConfigCell, CompositionCell, XRDCell } from './renderers/crossplane-cells'
+import { isManagedResource, isComposite } from './resource-utils-crossplane'
 import { VirtualServiceCell, DestinationRuleCell, IstioGatewayCell, ServiceEntryCell, PeerAuthenticationCell, AuthorizationPolicyCell } from './renderers/istio-cells'
 import { KnativeServiceCell, ConfigurationCell as KnativeConfigurationCell, RevisionCell as KnativeRevisionCell, RouteCell as KnativeRouteCell, BrokerCell, TriggerCell, EventTypeCell, PingSourceCell, ApiServerSourceCell, ContainerSourceCell, SinkBindingCell, ChannelCell, InMemoryChannelCell, SubscriptionCell, SequenceCell, ParallelCell, DomainMappingCell, ServerlessServiceCell, KnativeIngressCell, KnativeCertificateCell } from './renderers/knative-cells'
 import { IngressRouteCell, MiddlewareCell, TraefikServiceCell, ServersTransportCell, TLSOptionCell } from './renderers/traefik-cells'
@@ -148,6 +153,7 @@ import { AzureManagedControlPlaneCell, AzureManagedMachinePoolCell, AzureMachine
 import { useRegisterShortcut, useRegisterShortcuts } from '../../hooks/useKeyboardShortcuts'
 import { ResourcesSidebar } from './ResourcesSidebar'
 import type { SelectedKindInfo } from './ResourcesSidebar'
+import { CompareTray, togglePick, pickIndex, refToParam, SIDE_TONES, type CompareTrayPick, type NamespacedRef } from '../compare'
 
 // Pod problem filter options (special multi-select, not a single column value)
 const POD_PROBLEMS = ['CrashLoopBackOff', 'ImagePullBackOff', 'OOMKilled', 'Unschedulable', 'Not Ready', 'High Restarts', 'Init Failed', 'Exit Code Error', 'Failed', 'Other'] as const
@@ -155,7 +161,7 @@ const WORKLOAD_PROBLEMS = ['Unavailable', 'Rollout Stuck', 'Rollout In Progress'
 const WORKLOAD_KINDS = new Set(['deployments', 'statefulsets', 'daemonsets'])
 
 // Columns to skip for auto-detected filters (high cardinality, text-like, or non-filterable)
-const SKIP_FILTER_COLUMNS = new Set([
+export const SKIP_FILTER_COLUMNS = new Set([
   'name', 'age', 'keys', 'size', 'images', 'domains', 'hosts', 'rules',
   'ports', 'message', 'url', 'ref', 'revision', 'path', 'selector', 'ready', 'restarts',
   'completions', 'duration', 'schedule', 'lastRun', 'target', 'replicas', 'metrics',
@@ -163,11 +169,21 @@ const SKIP_FILTER_COLUMNS = new Set([
   'issuer', 'domain', 'presented', 'listeners', 'routes', 'addresses', 'hostnames',
   'parents', 'backends', 'controller', 'description', 'externalIP', 'address',
   'conditions', 'taints', 'desired', 'upToDate', 'available', 'owner',
-  'tls', 'endpoints', 'object', 'count', 'lastSeen', 'reason', 'source', 'inventory',
+  'tls', 'endpoints', 'object', 'count', 'lastSeen', 'source', 'inventory',
   'lastUpdated', 'chart', 'events', 'repo',
   'generators', 'applications', 'destinations', 'sources', 'budget', 'healthy', 'allowed',
   'secrets', 'subjects', 'role', 'entrypoint', 'templates',
 ])
+
+// Namespace/node cardinality scales with cluster size, not kind enum size;
+// node keeps a generous cap as a sanity bound, namespace is uncapped.
+export function isColumnFilterableByDistinctCount(colKey: string, distinctCount: number): boolean {
+  if (SKIP_FILTER_COLUMNS.has(colKey)) return false
+  const maxDistinct = colKey === 'namespace'
+    ? Number.POSITIVE_INFINITY
+    : colKey === 'node' ? 200 : 30
+  return distinctCount >= 2 && distinctCount <= maxDistinct
+}
 
 // Column definitions per resource kind
 interface Column {
@@ -213,6 +229,13 @@ const TAILWIND_WIDTH_TO_PX: Record<string, number> = {
   'w-48': 192, 'w-56': 224, 'w-64': 256,
 }
 
+const COMPARE_COLUMN_WIDTH = 36
+const COMPARE_COLUMN_STYLE: React.CSSProperties = {
+  width: COMPARE_COLUMN_WIDTH,
+  minWidth: COMPARE_COLUMN_WIDTH,
+  maxWidth: COMPARE_COLUMN_WIDTH,
+}
+
 function getColumnMinWidth(col: Column): number {
   if (col.minWidth) return col.minWidth
   if (!col.width) return 200 // Name column (no width class) gets wider minimum
@@ -233,11 +256,11 @@ const KNOWN_COLUMNS: Record<string, Column[]> = {
   pods: [
     { key: 'name', label: 'Name' },
     { key: 'namespace', label: 'Namespace', width: 'w-48' },
-    { key: 'containers', label: 'Containers', width: 'w-28' },
+    { key: 'containers', label: 'Containers', width: 'w-32', tooltip: 'Container readiness; hover each square for name and state' },
     { key: 'status', label: 'Status', width: 'w-40' },
     { key: 'cpu', label: 'CPU', width: 'w-40', tooltip: 'CPU usage / limit (marker = request)' },
     { key: 'memory', label: 'Memory', width: 'w-40', tooltip: 'Memory usage / limit (marker = request)' },
-    { key: 'restarts', label: 'Restarts', width: 'w-24' },
+    { key: 'restarts', label: 'Restarts', width: 'w-28' },
     { key: 'podIP', label: 'Pod IP', width: 'w-32', defaultVisible: false },
     { key: 'node', label: 'Node', width: 'w-44', hideOnMobile: true },
     { key: 'age', label: 'Age', width: 'w-24' },
@@ -246,8 +269,8 @@ const KNOWN_COLUMNS: Record<string, Column[]> = {
     { key: 'name', label: 'Name' },
     { key: 'namespace', label: 'Namespace', width: 'w-48' },
     { key: 'ready', label: 'Ready', width: 'w-24', tooltip: 'Ready pods / Desired replicas' },
-    { key: 'upToDate', label: 'Up-to-date', width: 'w-24', hideOnMobile: true, tooltip: 'Number of pods running the current pod template' },
-    { key: 'available', label: 'Available', width: 'w-24', hideOnMobile: true, tooltip: 'Number of pods available (ready for minReadySeconds)' },
+    { key: 'upToDate', label: 'Up-to-date', width: 'w-32', hideOnMobile: true, tooltip: 'Number of pods running the current pod template' },
+    { key: 'available', label: 'Available', width: 'w-28', hideOnMobile: true, tooltip: 'Number of pods available (ready for minReadySeconds)' },
     { key: 'images', label: 'Images', width: 'w-48', hideOnMobile: true },
     { key: 'age', label: 'Age', width: 'w-24' },
   ],
@@ -256,8 +279,8 @@ const KNOWN_COLUMNS: Record<string, Column[]> = {
     { key: 'namespace', label: 'Namespace', width: 'w-48' },
     { key: 'desired', label: 'Desired', width: 'w-20', tooltip: 'Number of nodes that should run the daemon pod (based on node selector)' },
     { key: 'ready', label: 'Ready', width: 'w-20', tooltip: 'Number of pods that are ready (passing readiness probes)' },
-    { key: 'upToDate', label: 'Up-to-date', width: 'w-24', hideOnMobile: true, tooltip: 'Number of pods running the current pod template spec' },
-    { key: 'available', label: 'Available', width: 'w-24', hideOnMobile: true, tooltip: 'Number of pods available (ready for minReadySeconds duration)' },
+    { key: 'upToDate', label: 'Up-to-date', width: 'w-32', hideOnMobile: true, tooltip: 'Number of pods running the current pod template spec' },
+    { key: 'available', label: 'Available', width: 'w-28', hideOnMobile: true, tooltip: 'Number of pods available (ready for minReadySeconds duration)' },
     { key: 'images', label: 'Images', width: 'w-48', hideOnMobile: true },
     { key: 'age', label: 'Age', width: 'w-24' },
   ],
@@ -265,7 +288,7 @@ const KNOWN_COLUMNS: Record<string, Column[]> = {
     { key: 'name', label: 'Name' },
     { key: 'namespace', label: 'Namespace', width: 'w-48' },
     { key: 'ready', label: 'Ready', width: 'w-24', tooltip: 'Ready pods / Desired replicas' },
-    { key: 'upToDate', label: 'Up-to-date', width: 'w-24', hideOnMobile: true, tooltip: 'Number of pods running the current pod template' },
+    { key: 'upToDate', label: 'Up-to-date', width: 'w-32', hideOnMobile: true, tooltip: 'Number of pods running the current pod template' },
     { key: 'images', label: 'Images', width: 'w-48', hideOnMobile: true },
     { key: 'age', label: 'Age', width: 'w-24' },
   ],
@@ -285,6 +308,16 @@ const KNOWN_COLUMNS: Record<string, Column[]> = {
     { key: 'endpoints', label: 'Endpoints', width: 'w-24' },
     { key: 'ports', label: 'Ports', width: 'w-40' },
     { key: 'externalIP', label: 'External', width: 'w-40', hideOnMobile: true },
+    { key: 'age', label: 'Age', width: 'w-24' },
+  ],
+  endpointslices: [
+    { key: 'name', label: 'Name' },
+    { key: 'namespace', label: 'Namespace', width: 'w-48' },
+    { key: 'service', label: 'Service', width: 'w-48' },
+    { key: 'addressType', label: 'Address Type', width: 'w-28' },
+    { key: 'endpoints', label: 'Endpoints', width: 'w-32' },
+    { key: 'addresses', label: 'Addresses', width: 'w-24' },
+    { key: 'ports', label: 'Ports', width: 'w-40', hideOnMobile: true },
     { key: 'age', label: 'Age', width: 'w-24' },
   ],
   ingresses: [
@@ -328,7 +361,7 @@ const KNOWN_COLUMNS: Record<string, Column[]> = {
     { key: 'name', label: 'Name' },
     { key: 'namespace', label: 'Namespace', width: 'w-48' },
     { key: 'status', label: 'Status', width: 'w-28' },
-    { key: 'completions', label: 'Completions', width: 'w-28' },
+    { key: 'completions', label: 'Completions', width: 'w-32' },
     { key: 'duration', label: 'Duration', width: 'w-24', hideOnMobile: true },
     { key: 'age', label: 'Age', width: 'w-24' },
   ],
@@ -363,7 +396,7 @@ const KNOWN_COLUMNS: Record<string, Column[]> = {
     { key: 'namespace', label: 'Namespace', width: 'w-48' },
     { key: 'status', label: 'Status', width: 'w-24' },
     { key: 'capacity', label: 'Capacity', width: 'w-24' },
-    { key: 'storageClass', label: 'Storage Class', width: 'w-36', hideOnMobile: true },
+    { key: 'storageClass', label: 'Storage Class', width: 'w-40', hideOnMobile: true },
     { key: 'accessModes', label: 'Access', width: 'w-20', tooltip: 'Access modes: RWO=ReadWriteOnce, RWX=ReadWriteMany, ROX=ReadOnlyMany' },
     { key: 'volume', label: 'Volume', width: 'w-48', hideOnMobile: true },
     { key: 'age', label: 'Age', width: 'w-24' },
@@ -402,7 +435,7 @@ const KNOWN_COLUMNS: Record<string, Column[]> = {
     { key: 'capacity', label: 'Capacity', width: 'w-24' },
     { key: 'accessModes', label: 'Access', width: 'w-20', tooltip: 'RWO=ReadWriteOnce, ROX=ReadOnlyMany, RWX=ReadWriteMany' },
     { key: 'reclaimPolicy', label: 'Reclaim', width: 'w-20' },
-    { key: 'storageClass', label: 'Storage Class', width: 'w-36', hideOnMobile: true },
+    { key: 'storageClass', label: 'Storage Class', width: 'w-40', hideOnMobile: true },
     { key: 'claim', label: 'Claim', width: 'w-48', hideOnMobile: true },
     { key: 'age', label: 'Age', width: 'w-24' },
   ],
@@ -667,8 +700,8 @@ const KNOWN_COLUMNS: Record<string, Column[]> = {
   serviceaccounts: [
     { key: 'name', label: 'Name' },
     { key: 'namespace', label: 'Namespace', width: 'w-48' },
-    { key: 'automount', label: 'Automount', width: 'w-24', tooltip: 'Whether token is automatically mounted in pods' },
-    { key: 'secrets', label: 'Secrets', width: 'w-20' },
+    { key: 'automount', label: 'Automount', width: 'w-32', tooltip: 'Whether token is automatically mounted in pods' },
+    { key: 'secrets', label: 'Secrets', width: 'w-24' },
     { key: 'age', label: 'Age', width: 'w-24' },
   ],
   roles: [
@@ -705,13 +738,13 @@ const KNOWN_COLUMNS: Record<string, Column[]> = {
     { key: 'name', label: 'Name' },
     { key: 'namespace', label: 'Namespace', width: 'w-48' },
     { key: 'holder', label: 'Holder', width: 'w-48' },
-    { key: 'renewTime', label: 'Last Renewed', width: 'w-28' },
+    { key: 'renewTime', label: 'Last Renewed', width: 'w-32' },
     { key: 'age', label: 'Age', width: 'w-24' },
   ],
   priorityclasses: [
     { key: 'name', label: 'Name' },
     { key: 'value', label: 'Value', width: 'w-24' },
-    { key: 'globalDefault', label: 'Global Default', width: 'w-28' },
+    { key: 'globalDefault', label: 'Global Default', width: 'w-36' },
     { key: 'preemptionPolicy', label: 'Preemption', width: 'w-32' },
     { key: 'description', label: 'Description', width: 'w-64', hideOnMobile: true },
     { key: 'age', label: 'Age', width: 'w-24' },
@@ -723,27 +756,27 @@ const KNOWN_COLUMNS: Record<string, Column[]> = {
   ],
   mutatingwebhookconfigurations: [
     { key: 'name', label: 'Name' },
-    { key: 'webhooks', label: 'Webhooks', width: 'w-20' },
-    { key: 'failurePolicy', label: 'Failure Policy', width: 'w-28' },
+    { key: 'webhooks', label: 'Webhooks', width: 'w-28' },
+    { key: 'failurePolicy', label: 'Failure Policy', width: 'w-36' },
     { key: 'target', label: 'Target', width: 'w-48', hideOnMobile: true },
     { key: 'age', label: 'Age', width: 'w-24' },
   ],
   validatingwebhookconfigurations: [
     { key: 'name', label: 'Name' },
-    { key: 'webhooks', label: 'Webhooks', width: 'w-20' },
-    { key: 'failurePolicy', label: 'Failure Policy', width: 'w-28' },
+    { key: 'webhooks', label: 'Webhooks', width: 'w-28' },
+    { key: 'failurePolicy', label: 'Failure Policy', width: 'w-36' },
     { key: 'target', label: 'Target', width: 'w-48', hideOnMobile: true },
     { key: 'age', label: 'Age', width: 'w-24' },
   ],
   events: [
     { key: 'name', label: 'Name' },
     { key: 'namespace', label: 'Namespace', width: 'w-36' },
-    { key: 'type', label: 'Type', width: 'w-20' },
-    { key: 'reason', label: 'Reason', width: 'w-28' },
+    { key: 'type', label: 'Type', width: 'w-24' },
+    { key: 'reason', label: 'Reason', width: 'w-32' },
     { key: 'message', label: 'Message', width: 'w-64' },
     { key: 'object', label: 'Object', width: 'w-48', hideOnMobile: true },
-    { key: 'count', label: 'Count', width: 'w-16' },
-    { key: 'lastSeen', label: 'Last Seen', width: 'w-24' },
+    { key: 'count', label: 'Count', width: 'w-20' },
+    { key: 'lastSeen', label: 'Last Seen', width: 'w-28' },
   ],
   // ============================================================================
   // FLUXCD GITOPS RESOURCES
@@ -791,6 +824,7 @@ const KNOWN_COLUMNS: Record<string, Column[]> = {
     { key: 'chart', label: 'Chart', width: 'w-40' },
     { key: 'version', label: 'Version', width: 'w-24' },
     { key: 'status', label: 'Status', width: 'w-24' },
+    { key: 'message', label: 'Message', width: 'w-64', hideOnMobile: true, tooltip: 'Last diagnostic message — distinguishes dependency-wait, install/upgrade failure, and test failure' },
     { key: 'revision', label: 'Rev', width: 'w-16', hideOnMobile: true, tooltip: 'Helm release revision number' },
     { key: 'lastUpdated', label: 'Last Updated', width: 'w-28', tooltip: 'Time since last successful reconciliation' },
     { key: 'age', label: 'Age', width: 'w-24' },
@@ -932,7 +966,7 @@ const KNOWN_COLUMNS: Record<string, Column[]> = {
     { key: 'store', label: 'Store', width: 'w-36' },
     { key: 'provider', label: 'Provider', width: 'w-28' },
     { key: 'refreshInterval', label: 'Refresh', width: 'w-24' },
-    { key: 'lastSync', label: 'Last Sync', width: 'w-24' },
+    { key: 'lastSync', label: 'Last Sync', width: 'w-28' },
     { key: 'age', label: 'Age', width: 'w-24' },
   ],
   clusterexternalsecrets: [
@@ -966,7 +1000,7 @@ const KNOWN_COLUMNS: Record<string, Column[]> = {
     { key: 'namespaces', label: 'Scope', width: 'w-24', tooltip: 'Included namespaces (* = all)' },
     { key: 'duration', label: 'Duration', width: 'w-24' },
     { key: 'expiry', label: 'Expires', width: 'w-24' },
-    { key: 'errors', label: 'Errors', width: 'w-16' },
+    { key: 'errors', label: 'Errors', width: 'w-20' },
     { key: 'age', label: 'Age', width: 'w-24' },
   ],
   restores: [
@@ -975,7 +1009,7 @@ const KNOWN_COLUMNS: Record<string, Column[]> = {
     { key: 'status', label: 'Status', width: 'w-28' },
     { key: 'backupName', label: 'Backup', width: 'w-40' },
     { key: 'duration', label: 'Duration', width: 'w-24' },
-    { key: 'errors', label: 'Errors', width: 'w-16' },
+    { key: 'errors', label: 'Errors', width: 'w-20' },
     { key: 'age', label: 'Age', width: 'w-24' },
   ],
   schedules: [
@@ -1004,10 +1038,10 @@ const KNOWN_COLUMNS: Record<string, Column[]> = {
     { key: 'name', label: 'Name' },
     { key: 'namespace', label: 'Namespace', width: 'w-36' },
     { key: 'status', label: 'Status', width: 'w-28' },
-    { key: 'instances', label: 'Instances', width: 'w-24', tooltip: 'Ready/Total' },
+    { key: 'instances', label: 'Instances', width: 'w-28', tooltip: 'Ready/Total' },
     { key: 'primary', label: 'Primary', width: 'w-36' },
     { key: 'image', label: 'Image', width: 'w-28' },
-    { key: 'storage', label: 'Storage', width: 'w-20' },
+    { key: 'storage', label: 'Storage', width: 'w-28' },
     { key: 'age', label: 'Age', width: 'w-24' },
   ],
   scheduledbackups: [
@@ -1016,8 +1050,8 @@ const KNOWN_COLUMNS: Record<string, Column[]> = {
     { key: 'status', label: 'Status', width: 'w-24' },
     { key: 'cluster', label: 'Cluster', width: 'w-36' },
     { key: 'schedule', label: 'Schedule', width: 'w-36' },
-    { key: 'lastSchedule', label: 'Last Run', width: 'w-24' },
-    { key: 'suspended', label: 'Suspended', width: 'w-20' },
+    { key: 'lastSchedule', label: 'Last Run', width: 'w-28' },
+    { key: 'suspended', label: 'Suspended', width: 'w-28' },
     { key: 'age', label: 'Age', width: 'w-24' },
   ],
   poolers: [
@@ -1026,8 +1060,8 @@ const KNOWN_COLUMNS: Record<string, Column[]> = {
     { key: 'status', label: 'Status', width: 'w-24' },
     { key: 'cluster', label: 'Cluster', width: 'w-36' },
     { key: 'type', label: 'Type', width: 'w-16' },
-    { key: 'poolMode', label: 'Pool Mode', width: 'w-28' },
-    { key: 'instances', label: 'Instances', width: 'w-24', tooltip: 'Ready/Total' },
+    { key: 'poolMode', label: 'Pool Mode', width: 'w-32' },
+    { key: 'instances', label: 'Instances', width: 'w-28', tooltip: 'Ready/Total' },
     { key: 'age', label: 'Age', width: 'w-24' },
   ],
   // ============================================================================
@@ -1101,7 +1135,7 @@ const KNOWN_COLUMNS: Record<string, Column[]> = {
     { key: 'status', label: 'Status', width: 'w-28' },
     { key: 'routing', label: 'Traffic', width: 'w-20', tooltip: 'Whether this revision is receiving traffic' },
     { key: 'image', label: 'Image', width: 'w-48' },
-    { key: 'concurrency', label: 'Concurrency', width: 'w-24' },
+    { key: 'concurrency', label: 'Concurrency', width: 'w-32' },
     { key: 'age', label: 'Age', width: 'w-24' },
   ],
   knativeroutes: [
@@ -1363,7 +1397,7 @@ const KNOWN_COLUMNS: Record<string, Column[]> = {
     { key: 'namespace', label: 'Namespace', width: 'w-36 shrink-0' },
     { key: 'cluster', label: 'Cluster', width: 'w-32 shrink-0' },
     { key: 'ready', label: 'Ready', width: 'w-20 shrink-0' },
-    { key: 'initialized', label: 'Initialized', width: 'w-24 shrink-0' },
+    { key: 'initialized', label: 'Initialized', width: 'w-28 shrink-0' },
     { key: 'version', label: 'Version', width: 'w-24 shrink-0' },
     { key: 'age', label: 'Age', width: 'w-24 shrink-0' },
   ],
@@ -1513,6 +1547,43 @@ const KNOWN_COLUMNS: Record<string, Column[]> = {
     { key: 'status', label: 'Status', width: 'w-28 shrink-0' },
     { key: 'age', label: 'Age', width: 'w-24 shrink-0' },
   ],
+  // Crossplane — Managed Resources are unbounded (one kind per provider CRD);
+  // routed via isLikelyCrossplaneMRGroup, not by exact kind plural.
+  crossplanemanagedresources: [
+    { key: 'name', label: 'Name', width: 'min-w-40' },
+    { key: 'namespace', label: 'Namespace', width: 'w-32 shrink-0' },
+    { key: 'kind', label: 'Kind', width: 'w-32 shrink-0' },
+    { key: 'external', label: 'External Name', width: 'min-w-48', hideOnMobile: true },
+    { key: 'provider', label: 'Provider Config', width: 'w-40 shrink-0', hideOnMobile: true },
+    { key: 'status', label: 'Status', width: 'w-32 shrink-0' },
+    { key: 'age', label: 'Age', width: 'w-24 shrink-0' },
+  ],
+  providers: [
+    { key: 'name', label: 'Name', width: 'min-w-40' },
+    { key: 'package', label: 'Package', width: 'min-w-48' },
+    { key: 'revision', label: 'Revision', width: 'w-36 shrink-0', hideOnMobile: true },
+    { key: 'status', label: 'Status', width: 'w-32 shrink-0' },
+    { key: 'age', label: 'Age', width: 'w-24 shrink-0' },
+  ],
+  providerconfigs: [
+    { key: 'name', label: 'Name', width: 'min-w-40' },
+    { key: 'credentials', label: 'Credentials', width: 'w-36 shrink-0' },
+    { key: 'status', label: 'Status', width: 'w-32 shrink-0' },
+    { key: 'age', label: 'Age', width: 'w-24 shrink-0' },
+  ],
+  compositions: [
+    { key: 'name', label: 'Name', width: 'min-w-40' },
+    { key: 'composite', label: 'Composite Kind', width: 'w-44 shrink-0' },
+    { key: 'mode', label: 'Mode', width: 'w-24 shrink-0' },
+    { key: 'functions', label: 'Functions', width: 'w-28 shrink-0', hideOnMobile: true },
+    { key: 'age', label: 'Age', width: 'w-24 shrink-0' },
+  ],
+  compositeresourcedefinitions: [
+    { key: 'name', label: 'Name', width: 'min-w-40' },
+    { key: 'kind', label: 'Kind', width: 'w-40 shrink-0' },
+    { key: 'claim', label: 'Claim Kind', width: 'w-40 shrink-0', hideOnMobile: true },
+    { key: 'age', label: 'Age', width: 'w-24 shrink-0' },
+  ],
 }
 
 // Map (plural, group) → KNOWN_COLUMNS key for kinds that collide with core K8s
@@ -1545,8 +1616,32 @@ function normalizeKindToPlural(kind: string, group?: string): string {
   return lower
 }
 
+// Crossplane Managed Resources are unbounded (each provider ships its own
+// CRDs under per-service groups like s3.aws.upbound.io, compute.gcp.upbound.io).
+// Route any non-core-Crossplane resource in these groups to the generic MR
+// column set. ProviderConfig is excluded — those have their own renderer.
+function isLikelyCrossplaneMRGroup(kind: string, group: string): boolean {
+  if (!group) return false
+  const k = kind.toLowerCase()
+  if (k === 'providerconfig' || k === 'providerconfigs') return false
+  if (group.endsWith('.upbound.io')) return true
+  if (group === 'kubernetes.crossplane.io' || group === 'helm.crossplane.io') return true
+  // Reserved Crossplane core groups — never MRs.
+  if (group === 'crossplane.io' || group === 'pkg.crossplane.io' || group === 'apiextensions.crossplane.io') {
+    return false
+  }
+  // Any other *.crossplane.io subgroup is presumed to be a provider's MR group.
+  if (group.endsWith('.crossplane.io')) return true
+  return false
+}
+
 function getColumnsForKind(kind: string, group?: string): Column[] {
-  return KNOWN_COLUMNS[normalizeKindToPlural(kind, group)] || DEFAULT_COLUMNS
+  const key = normalizeKindToPlural(kind, group)
+  if (KNOWN_COLUMNS[key]) return KNOWN_COLUMNS[key]
+  if (group && isLikelyCrossplaneMRGroup(kind, group)) {
+    return KNOWN_COLUMNS.crossplanemanagedresources
+  }
+  return DEFAULT_COLUMNS
 }
 
 // Get the default visible columns for a kind
@@ -1604,11 +1699,6 @@ interface ResourcesViewData {
 
 export const ResourcesViewDataContext = React.createContext<ResourcesViewData>({})
 
-// Inline helper replacing ApiError/isForbiddenError from the removed api/client import
-function isForbiddenError(error: any): boolean {
-  return error?.status === 403
-}
-
 export interface ResourceQueryResult {
   data?: any[]
   isLoading: boolean
@@ -1655,6 +1745,8 @@ interface ResourcesViewProps {
   hideSidebar?: boolean
   /** Callback when the [+] create button is clicked. Receives the currently selected kind info. */
   onCreateResource?: (kind: { name: string; kind: string; group: string } | null) => void
+  /** Default kind when the URL does not include one. */
+  defaultKind?: SelectedKindInfo
   /** Columns prepended to KNOWN_COLUMNS for every kind. For example, a
    *  multi-cluster host can inject a leading Cluster column. Each extra
    *  column is self-contained (own render/sort/filter), so the host
@@ -1677,6 +1769,42 @@ interface ResourcesViewProps {
    *  should also wire onResourceClick to handle the deep-link-on-load
    *  case. */
   onRowSelect?: (resource: any) => void
+  /**
+   * When provided, the name cell renders as a real `<a href>` instead of
+   * relying on per-cell click handlers for navigation. Restores ⌘-click /
+   * middle-click / "Copy link" / hover URL preview / screen-reader link
+   * semantics. Hosts using full-page navigation should prefer this over
+   * `onRowSelect`; the anchor will own navigation and the rest of the row
+   * remains clickable for selection (drawer open).
+   */
+  rowHrefFor?: (resource: any) => string
+  /**
+   * Overrides the default compare-mode submit (which navigates to
+   * `/compare?kind=...&a=...&b=...`). Hosts use this to route to a
+   * different URL — e.g. Radar Hub's `/fleet/compare` with cluster IDs.
+   * Picks arrive in click order, each carrying `clusterId`/`clusterName`
+   * when `resolveRowCluster` is set (which is what keeps cross-cluster
+   * picks distinct in the equality check).
+   */
+  onCompareSubmit?: (
+    picks: NamespacedRef[],
+    kind: { name: string; group?: string },
+  ) => void
+  /**
+   * Resolves the cluster scope for a row when compare-mode is enabled.
+   * Stamps `clusterId`/`clusterName` onto each pick so the same `ns/name`
+   * in two different clusters is treated as two distinct picks. Hub-web
+   * returns `row._cluster` here; OSS leaves it unset and picks key on
+   * namespace+name only.
+   */
+  resolveRowCluster?: (resource: any) => { id: string; name: string } | undefined
+  /**
+   * Clears the global namespace selection (the header NamespaceSwitcher state).
+   * When wired, the "Clear filters" button also drops the active namespaces;
+   * otherwise it only resets the view-local filter state. Host-owned because
+   * the switcher lives outside this component and may persist server-side.
+   */
+  onClearNamespaces?: () => void
 }
 
 // Default selected kind
@@ -1692,6 +1820,7 @@ const DEFAULT_KIND_INFO: SelectedKindInfo = { name: 'pods', kind: 'Pod', group: 
 // fall through to DEFAULT_KIND.
 function getInitialKindFromURL(
   basePath: string = '/resources',
+  defaultKind: SelectedKindInfo = DEFAULT_KIND_INFO,
   locationPathname?: string,
   locationSearch?: string,
 ): SelectedKindInfo {
@@ -1726,7 +1855,7 @@ function getInitialKindFromURL(
     }
     return { name: kind, kind: kind, group }
   }
-  return DEFAULT_KIND_INFO
+  return defaultKind
 }
 
 // Get initial filters from URL
@@ -1748,6 +1877,51 @@ function getInitialFiltersFromURL() {
 
 // Sort state type
 type SortDirection = 'asc' | 'desc' | null
+
+// Coarse "just now / Xm / Xh / Xd" buckets — finer-grained updates
+// add motion in the periphery without aiding any user decision.
+function formatLastUpdatedBucket(elapsedMs: number): string {
+  const elapsedSec = Math.max(0, Math.floor(elapsedMs / 1000))
+  if (elapsedSec < 60) return 'just now'
+  const minutes = Math.floor(elapsedSec / 60)
+  if (minutes < 60) return `${minutes}m`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return `${hours}h`
+  return `${Math.floor(hours / 24)}d`
+}
+
+// ms until the displayed bucket would change.
+function msToNextBucket(elapsedMs: number): number {
+  const elapsed = Math.max(0, elapsedMs)
+  if (elapsed < 60_000) return 60_000 - elapsed
+  if (elapsed < 3_600_000) return 60_000 - (elapsed % 60_000)
+  if (elapsed < 86_400_000) return 3_600_000 - (elapsed % 3_600_000)
+  return 86_400_000 - (elapsed % 86_400_000)
+}
+
+// Isolated subtree so re-renders don't cascade into the parent's
+// virtualized table.
+function LastUpdatedLabel({ lastUpdated }: { lastUpdated: Date }) {
+  const [, force] = useState(0)
+  useEffect(() => {
+    let id: ReturnType<typeof setTimeout>
+    function schedule() {
+      const delay = Math.max(1000, msToNextBucket(Date.now() - lastUpdated.getTime()))
+      id = setTimeout(() => {
+        force(t => t + 1)
+        schedule()
+      }, delay)
+    }
+    schedule()
+    return () => clearTimeout(id)
+  }, [lastUpdated])
+  return (
+    <div className="flex items-center gap-1.5 text-xs text-theme-text-tertiary">
+      <Clock className="w-3.5 h-3.5" />
+      <span>Updated {formatLastUpdatedBucket(Date.now() - lastUpdated.getTime())}</span>
+    </div>
+  )
+}
 
 export function ResourcesView({
   namespaces, selectedResource, onResourceClick, onResourceClickYaml, onKindChange,
@@ -1772,23 +1946,33 @@ export function ResourcesView({
   onSelectedKindChange,
   hideSidebar = false,
   onCreateResource,
+  defaultKind = DEFAULT_KIND_INFO,
   extraLeadingColumns,
   onRowSelect,
+  rowHrefFor,
+  onCompareSubmit,
+  resolveRowCluster,
+  onClearNamespaces,
 }: ResourcesViewProps) {
   const initialFilters = getInitialFiltersFromURL()
-  const [selectedKind, setSelectedKind] = useState<SelectedKindInfo>(() => getInitialKindFromURL(basePath, locationPathname, locationSearch))
-  // Sync selectedKind from URL when locationPathname changes (e.g., browser back, external sidebar navigation)
+  const [selectedKind, setSelectedKind] = useState<SelectedKindInfo>(() => getInitialKindFromURL(basePath, defaultKind, locationPathname, locationSearch))
+  // Sync selectedKind from URL when the URL changes (browser back, external sidebar navigation).
+  // Deps are URL-derived only — including selectedKind.name/group would race against pending
+  // navigation: a sidebar click flips state before navigate() lands, this effect re-reads the
+  // stale URL, and reverts the kind. The window into a stale URL between state change and URL
+  // update is what produced the "blink and fail to navigate" bug.
   useEffect(() => {
-    const kindFromURL = getInitialKindFromURL(basePath, locationPathname, locationSearch)
-    if (kindFromURL.name !== selectedKind.name || kindFromURL.group !== selectedKind.group) {
-      setSelectedKind(kindFromURL)
-    }
-  }, [locationPathname, locationSearch]) // eslint-disable-line react-hooks/exhaustive-deps
+    const kindFromURL = getInitialKindFromURL(basePath, defaultKind, locationPathname, locationSearch)
+    setSelectedKind((prev) =>
+      kindFromURL.name !== prev.name || kindFromURL.group !== prev.group ? kindFromURL : prev,
+    )
+  }, [basePath, defaultKind, locationPathname, locationSearch])
   // Notify parent of selected kind changes (including initial mount)
   useEffect(() => {
     onSelectedKindChange?.(selectedKind)
   }, [selectedKind.name, selectedKind.group]) // eslint-disable-line react-hooks/exhaustive-deps
   const [searchTerm, setSearchTerm] = useState(initialFilters.search)
+  const [regexMode, setRegexMode] = useState(false)
   const [sortColumn, setSortColumn] = useState<string | null>(null)
   const [sortDirection, setSortDirection] = useState<SortDirection>(null)
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null)
@@ -1850,6 +2034,9 @@ export function ResourcesView({
   const hasProcessedInitialResource = useRef(false)
   // Set by sidebar kind change to push a browser history entry (vs replace for filter changes)
   const shouldPushHistory = useRef(false)
+  // Used by the URL-write effect to distinguish drawer-to-drawer navigation (A -> B, push)
+  // from initial open (null -> X) and close (X -> null), which stay as URL replaces.
+  const prevSelectedResourceRef = useRef<SelectedResource | null>(null)
 
   // Ref to search input for keyboard shortcut
   const searchInputRef = useRef<HTMLInputElement>(null)
@@ -1910,6 +2097,13 @@ export function ResourcesView({
 
   useEffect(() => {
     const saved = loadColumnSettings(selectedKind.name, selectedKind.group)
+    // Host-injected extra columns (e.g. fleet Cluster) default to visible
+    // even when the saved column-visibility blob predates them — a naive
+    // Set(saved.visible) would silently hide host columns the user has
+    // never been shown. Trade-off: a user can't permanently hide a host
+    // extra column via the column picker — next mount re-adds it. Track
+    // a sibling "hidden-extras" set if this becomes a real complaint.
+    const extraKeys = extraLeadingColumns?.map(c => c.key) ?? []
     if (saved) {
       // If saved columns are just the defaults but this kind has specialized columns,
       // discard the stale save and use the specialized columns instead
@@ -1922,14 +2116,16 @@ export function ResourcesView({
         setVisibleColumns(getDefaultVisibleColumns(allColumns))
         setColumnWidths({})
       } else {
-        setVisibleColumns(new Set(saved.visible))
+        const merged = new Set(saved.visible)
+        for (const k of extraKeys) merged.add(k)
+        setVisibleColumns(merged)
         setColumnWidths(saved.widths || {})
       }
     } else {
       setVisibleColumns(getDefaultVisibleColumns(allColumns))
       setColumnWidths({})
     }
-  }, [selectedKind.name, selectedKind.group, allColumns])
+  }, [selectedKind.name, selectedKind.group, allColumns, extraLeadingColumns])
 
   // Save column settings when they change (skip initial load)
   const isColumnSettingsLoaded = useRef(false)
@@ -2065,9 +2261,59 @@ export function ResourcesView({
   const [highlightedIndex, setHighlightedIndex] = useState(-1)
   const virtuosoRef = useRef<TableVirtuosoHandle>(null)
 
+  // Compare mode is only meaningful when the host can route picks. Either
+  // path qualifies: onNavigate for the default same-cluster `/compare?...`
+  // URL, or onCompareSubmit for hosts that build their own URL (e.g.
+  // Radar Hub's `/fleet/compare` with cluster IDs).
+  const compareEnabled = !!onNavigate || !!onCompareSubmit
+  const [compareMode, setCompareMode] = useState(false)
+  const [comparePicks, setComparePicks] = useState<CompareTrayPick[]>([])
+
+  // Kind change invalidates picks AND mode — leaving the tray on with empty
+  // pills after the user moves to a different kind is more confusing than helpful.
+  useEffect(() => {
+    setComparePicks([])
+    setCompareMode(false)
+  }, [selectedKind.name, selectedKind.group])
+
+  const exitCompareMode = useCallback(() => {
+    setCompareMode(false)
+    setComparePicks([])
+  }, [])
+
+  const toggleComparePick = useCallback((resource: any) => {
+    if (!resource?.metadata?.name) return
+    const ns = resource.metadata.namespace || ''
+    // Stamp clusterId on the pick when the host provides a resolver
+    // (cross-cluster compare). Without it, two rows with the same ns+name
+    // from different clusters would collapse into one pick.
+    const cluster = resolveRowCluster?.(resource)
+    setComparePicks(prev => togglePick(prev, {
+      namespace: ns,
+      name: resource.metadata.name,
+      clusterId: cluster?.id,
+      clusterName: cluster?.name,
+    }))
+  }, [resolveRowCluster])
+
+  const handleCompareNavigate = useCallback(() => {
+    if (comparePicks.length !== 2) return
+    if (onCompareSubmit) {
+      onCompareSubmit(comparePicks, { name: selectedKind.name, group: selectedKind.group })
+      return
+    }
+    if (!onNavigate) return
+    const params = new URLSearchParams()
+    params.set('kind', selectedKind.name)
+    if (selectedKind.group) params.set('apiGroup', selectedKind.group)
+    params.set('a', refToParam(comparePicks[0]))
+    params.set('b', refToParam(comparePicks[1]))
+    onNavigate(`/compare?${params.toString()}`)
+  }, [comparePicks, selectedKind.name, selectedKind.group, onNavigate, onCompareSubmit])
+
   // Reset highlight when kind, search, sort, or namespace changes
   const namespacesKey = namespaces.join(',')
-  useEffect(() => { setHighlightedIndex(-1) }, [selectedKind.name, searchTerm, sortColumn, sortDirection, namespacesKey])
+  useEffect(() => { setHighlightedIndex(-1) }, [selectedKind.name, searchTerm, regexMode, sortColumn, sortDirection, namespacesKey])
 
   // Scroll highlighted row into view
   useEffect(() => {
@@ -2170,7 +2416,11 @@ export function ResourcesView({
       description: 'Open resource detail',
       category: 'Resource Actions',
       scope: 'resources',
-      handler: () => selectResource(getHighlightedResource()),
+      handler: () => {
+        const res = getHighlightedResource()
+        if (compareMode) toggleComparePick(res)
+        else selectResource(res)
+      },
       enabled: highlightedIndex >= 0,
     },
     {
@@ -2179,7 +2429,11 @@ export function ResourcesView({
       description: 'Open resource detail',
       category: 'Resource Actions',
       scope: 'resources',
-      handler: () => selectResource(getHighlightedResource()),
+      handler: () => {
+        const res = getHighlightedResource()
+        if (compareMode) toggleComparePick(res)
+        else selectResource(res)
+      },
       enabled: highlightedIndex >= 0,
     },
     {
@@ -2194,7 +2448,7 @@ export function ResourcesView({
         const cb = onResourceClickYaml || onResourceClick
         cb?.({ kind: selectedKind.name, namespace: res.metadata.namespace || '', name: res.metadata.name, group: selectedKind.group })
       },
-      enabled: highlightedIndex >= 0,
+      enabled: highlightedIndex >= 0 && !compareMode,
     },
     {
       id: 'resources-logs',
@@ -2218,7 +2472,7 @@ export function ResourcesView({
           openWorkloadLogs?.({ namespace: ns, workloadKind: selectedKind.kind, workloadName: name })
         }
       },
-      enabled: highlightedIndex >= 0 && ['pods', 'deployments', 'statefulsets', 'daemonsets', 'replicasets', 'jobs'].includes(selectedKind.name.toLowerCase()),
+      enabled: highlightedIndex >= 0 && !compareMode && ['pods', 'deployments', 'statefulsets', 'daemonsets', 'replicasets', 'jobs'].includes(selectedKind.name.toLowerCase()),
     },
     {
       id: 'resources-sort-name',
@@ -2251,11 +2505,11 @@ export function ResourcesView({
       category: 'Table',
       scope: 'resources',
       handler: () => {
-        // Close dropdowns first, then clear highlight, then blur search
         if (showColumnPicker) { setShowColumnPicker(false); return }
         if (openColumnFilter) { setOpenColumnFilter(null); return }
         if (showProblemsDropdown) { setShowProblemsDropdown(false); return }
         if (showLabelsDropdown) { setShowLabelsDropdown(false); return }
+        if (compareMode) { exitCompareMode(); return }
         if (highlightedIndex >= 0) setHighlightedIndex(-1)
         else searchInputRef.current?.blur()
       },
@@ -2336,7 +2590,7 @@ export function ResourcesView({
     isSyncingFromURL.current = true
 
     // Re-read URL params and update state
-    const newKind = getInitialKindFromURL(basePath, locationPathname, locationSearch)
+    const newKind = getInitialKindFromURL(basePath, defaultKind, locationPathname, locationSearch)
     const newFilters = getInitialFiltersFromURL()
 
     // Update kind if it changed
@@ -2366,7 +2620,7 @@ export function ResourcesView({
     requestAnimationFrame(() => {
       isSyncingFromURL.current = false
     })
-  }, [locationPathname, locationSearch]) // Re-run when injected URL path or search params change
+  }, [locationPathname, locationSearch, defaultKind, basePath]) // Re-run when injected URL path or search params change
 
   const navigate = useMemo(() => {
     if (!onNavigate) return (_pathOrObj: any, _opts?: any) => {}
@@ -2434,6 +2688,25 @@ export function ResourcesView({
     const newPath = `${basePath}/${kindInfo.name}`
     const queryStr = params.toString()
 
+    // No-op guard: if the target URL already matches the address bar, skip the
+    // navigate. Without this, a state catch-up after browser POP (App-level
+    // POP→state sync re-running this effect) would push a duplicate entry on
+    // top of the popped state — making the next Back appear to do nothing or
+    // (with multi-namespace name collisions) jump to a sibling resource via
+    // auto-resolution. Reading window.location avoids needing host-injected
+    // navigationType.
+    if (typeof window !== 'undefined') {
+      const currentPathname = window.location.pathname
+      const currentSearch = window.location.search.replace(/^\?/, '')
+      // Compare using basename-relative target path against window.pathname,
+      // which may include a host basename (e.g. /c/{cluster}). Treat a path
+      // suffix match as equal so embedded hosts don't false-trigger a write.
+      const pathMatches = currentPathname === newPath || currentPathname.endsWith(newPath)
+      if (pathMatches && currentSearch === queryStr) {
+        return
+      }
+    }
+
     // Route both push and replace through `navigate` (which honors the
     // onNavigate prop). The previous direct `window.history.replaceState`
     // bypass meant a host that wants to suppress URL writes (passing
@@ -2442,16 +2715,35 @@ export function ResourcesView({
     navigate({ pathname: newPath, search: queryStr }, { replace: !pushHistory })
   }, [navigate, basePath])
 
+  const clearAllFilters = useCallback(() => {
+    setSearchTerm('')
+    setColumnFilters({})
+    setProblemFilters([])
+    setLabelSelector('')
+    setOwnerKind('')
+    setOwnerName('')
+    setShowInactiveReplicaSets(false)
+    // Filter-only URL params. Path + kind + namespace + other cross-view
+    // params are out of scope here; the host's onClearNamespaces (and its
+    // own state→URL sync) owns namespace cleanup.
+    const params = new URLSearchParams(window.location.search)
+    for (const key of ['search', 'filters', 'problems', 'labels', 'ownerKind', 'ownerName', 'showInactive']) {
+      params.delete(key)
+    }
+    navigate({ pathname: window.location.pathname, search: params.toString() }, { replace: true })
+    onClearNamespaces?.()
+  }, [navigate, onClearNamespaces])
+
   // Update URL when any filter changes
   useEffect(() => {
     // Skip URL update if we're syncing FROM the URL (e.g., browser back button)
     if (isSyncingFromURL.current) {
-
+      prevSelectedResourceRef.current = selectedResource ?? null
       return
     }
     // Skip on initial mount so we don't strip ?resource= before the mount effect reads it
     if (!hasProcessedInitialResource.current) {
-
+      prevSelectedResourceRef.current = selectedResource ?? null
       return
     }
     // Skip URL update if selectedResource's kind doesn't match selectedKind (still syncing)
@@ -2462,12 +2754,38 @@ export function ResourcesView({
         return // Wait for kind sync effect to run first
       }
     }
-    // Push history when kind changes (so browser back/forward works), replace for filter changes
-    const pushHistory = shouldPushHistory.current
+    // Push history for navigations (so browser back works); replace for filter / drawer-toggle changes.
+    // A navigation is one of: explicit sidebar/keyboard kind switch (shouldPushHistory),
+    // kind change driven by external setSelectedResource (pathname differs from target — e.g. clicking a
+    // Parent Gateway from a TCPRoute drawer), or a drawer-to-drawer switch within the same kind
+    // (selectedResource A -> B, both non-null and different). Initial open (null -> X) and close (X -> null)
+    // stay as replace because they don't represent a destination the user wants to "go back" to.
+    const targetPath = `${basePath}/${selectedKind.name}`
+    // Compare basename-relative paths. Hosts that mount the app under a non-empty basename
+    // (e.g. Radar Hub at /c/{cluster}) inject `locationPathname` from useLocation(), which strips
+    // the basename — `window.location.pathname` still includes it, so reading window directly
+    // would never match `targetPath` (basename-relative) and force every URL write to push.
+    const currentPath =
+      locationPathname !== undefined
+        ? locationPathname
+        : typeof window !== 'undefined'
+          ? window.location.pathname
+          : ''
+    const pathChanged = currentPath !== targetPath
+    const prev = prevSelectedResourceRef.current
+    const current = selectedResource ?? null
+    const drawerSwitched =
+      prev !== null && current !== null &&
+      (prev.namespace !== current.namespace ||
+        prev.name !== current.name ||
+        prev.kind !== current.kind ||
+        (prev.group ?? '') !== (current.group ?? ''))
+    const pushHistory = shouldPushHistory.current || pathChanged || drawerSwitched
     shouldPushHistory.current = false
+    prevSelectedResourceRef.current = current
 
     updateURL(selectedKind, searchTerm, columnFilters, problemFilters, showInactiveReplicaSets, selectedResource?.namespace, selectedResource?.name, pushHistory)
-  }, [selectedKind, searchTerm, columnFilters, problemFilters, showInactiveReplicaSets, selectedResource, updateURL])
+  }, [selectedKind, searchTerm, columnFilters, problemFilters, showInactiveReplicaSets, selectedResource, updateURL, basePath, locationPathname])
 
   // Handle resource click from URL on mount
   useEffect(() => {
@@ -2624,12 +2942,18 @@ export function ResourcesView({
 
   const [refetch, isRefreshAnimating, refreshPhase] = useRefreshAnimation(() => refetchFn?.())
 
-  // Track last updated time
+  // React Query bumps dataUpdatedAt on no-op refetches (window focus,
+  // mount, sibling subscribers); structural sharing returns the same
+  // resources reference when data is byte-identical. Skip the timer
+  // reset in that case — otherwise opening a filter drawer looks like
+  // it triggered a real fetch.
+  const lastDataRef = useRef<unknown>(undefined)
   useEffect(() => {
-    if (dataUpdatedAt) {
-      setLastUpdated(new Date(dataUpdatedAt))
-    }
-  }, [dataUpdatedAt])
+    if (!dataUpdatedAt) return
+    if (resources === lastDataRef.current) return
+    lastDataRef.current = resources
+    setLastUpdated(new Date(dataUpdatedAt))
+  }, [dataUpdatedAt, resources])
 
   // Derive counts — prefer lightweight resourceCounts prop over full query data
   const counts = useMemo(() => {
@@ -2801,6 +3125,18 @@ export function ResourcesView({
   }, [])
 
 
+  // On an invalid pattern, fall back to a null matcher (search un-applied, all
+  // rows shown) rather than zero results, so the table doesn't flash empty
+  // while the user is mid-typing a pattern.
+  const searchRegex = useMemo<{ re: RegExp | null; error: string | null }>(() => {
+    if (!regexMode || !searchTerm) return { re: null, error: null }
+    try {
+      return { re: new RegExp(searchTerm, 'i'), error: null }
+    } catch (e) {
+      return { re: null, error: e instanceof Error ? e.message : 'Invalid regex' }
+    }
+  }, [regexMode, searchTerm])
+
   // Filter resources by search term, status, problems, and sort
   const filteredResources = useMemo(() => {
     if (!resources) return []
@@ -2809,11 +3145,21 @@ export function ResourcesView({
 
     // Apply search filter
     if (searchTerm) {
-      const term = searchTerm.toLowerCase()
-      result = result.filter((r: any) =>
-        r.metadata?.name?.toLowerCase().includes(term) ||
-        r.metadata?.namespace?.toLowerCase().includes(term)
-      )
+      if (regexMode) {
+        const re = searchRegex.re
+        if (re) {
+          result = result.filter((r: any) =>
+            re.test(r.metadata?.name ?? '') ||
+            re.test(r.metadata?.namespace ?? '')
+          )
+        }
+      } else {
+        const term = searchTerm.toLowerCase()
+        result = result.filter((r: any) =>
+          r.metadata?.name?.toLowerCase().includes(term) ||
+          r.metadata?.namespace?.toLowerCase().includes(term)
+        )
+      }
     }
 
     // Apply column filters (generic, multi-select per column — OR within column, AND across columns)
@@ -2969,7 +3315,7 @@ export function ResourcesView({
     }
 
     return result
-  }, [resources, searchTerm, columnFilters, problemFilters, showInactiveReplicaSets, labelSelector, ownerKind, ownerName, selectedKind.name, sortColumn, sortDirection, getSortValue, podMatchesProblemFilter])
+  }, [resources, searchTerm, regexMode, searchRegex, columnFilters, problemFilters, showInactiveReplicaSets, labelSelector, ownerKind, ownerName, selectedKind.name, sortColumn, sortDirection, getSortValue, podMatchesProblemFilter])
 
   // For nodes table: compute the majority minor version so outliers can be highlighted
   const majorityNodeMinorVersion = useMemo(() => {
@@ -3038,6 +3384,18 @@ export function ResourcesView({
     return allColumns.filter(c => visibleColumns.has(c.key))
   }, [allColumns, visibleColumns])
 
+  // Fixed-width columns can consume the table's flexible space and collapse
+  // the required name column. Keep a real table minimum and let the container
+  // scroll horizontally when the viewport is too narrow.
+  const tableMinWidth = useMemo(() => {
+    const compareColumnWidth = compareMode ? COMPARE_COLUMN_WIDTH : 0
+    const baseMinWidth = columns.reduce((sum, col) => sum + (columnWidths[col.key] || getColumnMinWidth(col)), compareColumnWidth)
+    const flexibleNameColumn = columns.find(col => col.key === 'name' && !columnWidths[col.key])
+
+    if (!hasResizedColumns || !flexibleNameColumn) return baseMinWidth
+    return baseMinWidth + getColumnMinWidth(flexibleNameColumn)
+  }, [columns, columnWidths, compareMode, hasResizedColumns])
+
   // Stable virtuoso components — memoized to avoid remounting the table on every render
   const virtuosoComponents = useMemo(() => ({
     Table: React.forwardRef<HTMLTableElement, React.TableHTMLAttributes<HTMLTableElement>>(function VirtuosoTable(props, ref) {
@@ -3046,9 +3404,17 @@ export function ResourcesView({
           {...props}
           ref={ref}
           className="w-full"
-          style={{ ...props.style, tableLayout: 'fixed' }}
+          style={{ ...props.style, tableLayout: 'fixed', minWidth: tableMinWidth }}
         >
           <colgroup>
+            {/*
+              Compare-mode adds a leading <th>/<td> per row but isn't part
+              of `columns`. Under table-layout:fixed the <colgroup> must
+              match the actual column count, otherwise the browser pads
+              the missing entry by stealing width from a sized neighbour
+              — typically blowing this narrow column out to ~200px.
+            */}
+            {compareMode && <col style={{ width: COMPARE_COLUMN_WIDTH }} />}
             {columns.map(col => (
               <col
                 key={col.key}
@@ -3066,7 +3432,7 @@ export function ResourcesView({
       )
     }),
     TableRow: VirtuosoTableRow,
-  }), [columns, columnWidths, hasResizedColumns])
+  }), [columns, columnWidths, hasResizedColumns, compareMode, tableMinWidth])
 
   // Calculate filter options with counts based on current resources (before filtering)
   const filterOptions = useMemo(() => {
@@ -3106,10 +3472,7 @@ export function ResourcesView({
       }
 
       const distinctCount = Object.keys(valueCounts).length
-      // Only include if 2-20 distinct values (too few = useless, too many = not a filter)
-      // Node column gets a higher cap (50) since clusters commonly have 20-50 nodes
-      const maxDistinct = col.key === 'node' ? 50 : 20
-      if (distinctCount >= 2 && distinctCount <= maxDistinct) {
+      if (isColumnFilterableByDistinctCount(col.key, distinctCount)) {
         filterableColumns.push({
           key: col.key,
           label: col.label,
@@ -3204,6 +3567,17 @@ export function ResourcesView({
 
   // Check if any filters are active
   const hasOwnerFilter = ownerKind !== '' && ownerName !== ''
+  // Namespace contribution gated on a host-wired clearer: without it the
+  // Clear filters button can't drop the namespace, so showing it would be
+  // a no-op for that case.
+  const hasAnyFilter =
+    !!searchTerm ||
+    !!labelSelector ||
+    hasOwnerFilter ||
+    problemFilters.length > 0 ||
+    Object.values(columnFilters).some((vals) => vals.length > 0) ||
+    showInactiveReplicaSets ||
+    (!!onClearNamespaces && namespaces.length > 0)
 
 
   // Toggle problem filter
@@ -3280,38 +3654,68 @@ export function ResourcesView({
       <div className="flex-1 flex flex-col overflow-hidden min-w-0 bg-theme-surface">
         {/* Toolbar */}
         <div className="flex items-center gap-3 px-4 py-3 border-b border-theme-border bg-theme-base shrink-0">
-          <div className="flex-1 relative">
-            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-theme-text-tertiary" />
-            <input
-              ref={searchInputRef}
-              type="text"
-              placeholder="Search... (press /)"
-              value={searchTerm}
-              onChange={(e) => setSearchTerm(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'ArrowDown') {
-                  // Hand off to the table's keyboard navigation — blur the input
-                  // so the registered ArrowDown/j/k shortcuts take over, and
-                  // highlight the first row.
-                  e.preventDefault()
-                  searchInputRef.current?.blur()
-                  setHighlightedIndex(0)
-                } else if (e.key === 'Enter' && filteredResourceCountRef.current > 0) {
-                  // Select the first (or currently highlighted) resource
-                  e.preventDefault()
-                  searchInputRef.current?.blur()
-                  if (highlightedIndex < 0) setHighlightedIndex(0)
-                  // Defer to next frame so the highlight renders before we open
-                  requestAnimationFrame(() => {
-                    const res = highlightedResourceRef.current ?? filteredResources[0]
-                    selectResource(res)
-                  })
-                } else if (e.key === 'Escape') {
-                  searchInputRef.current?.blur()
-                }
-              }}
-              className="w-full max-w-md pl-10 pr-4 py-2 bg-theme-elevated border border-theme-border-light rounded-lg text-sm text-theme-text-primary placeholder-theme-text-disabled focus:outline-none focus:ring-2 focus:ring-skyhook-500"
-            />
+          <div className="flex-1 min-w-0">
+            <div className="relative max-w-md">
+              <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-theme-text-tertiary" />
+              <input
+                ref={searchInputRef}
+                type="text"
+                placeholder={regexMode ? 'Search by regex... (press /)' : 'Search... (press /)'}
+                value={searchTerm}
+                onChange={(e) => setSearchTerm(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'ArrowDown') {
+                    // Hand off to the table's keyboard navigation — blur the input
+                    // so the registered ArrowDown/j/k shortcuts take over, and
+                    // highlight the first row.
+                    e.preventDefault()
+                    searchInputRef.current?.blur()
+                    setHighlightedIndex(0)
+                  } else if (e.key === 'Enter' && filteredResourceCountRef.current > 0) {
+                    // Select the first (or currently highlighted) resource
+                    e.preventDefault()
+                    searchInputRef.current?.blur()
+                    if (highlightedIndex < 0) setHighlightedIndex(0)
+                    // Defer to next frame so the highlight renders before we open
+                    requestAnimationFrame(() => {
+                      const res = highlightedResourceRef.current ?? filteredResources[0]
+                      selectResource(res)
+                    })
+                  } else if (e.key === 'Escape') {
+                    searchInputRef.current?.blur()
+                  }
+                }}
+                className={clsx(
+                  'w-full pl-10 pr-10 py-2 bg-theme-elevated border rounded-lg text-sm text-theme-text-primary placeholder-theme-text-disabled focus:outline-none focus:ring-2',
+                  searchRegex.error
+                    ? 'border-red-500/60 focus:ring-red-500'
+                    : 'border-theme-border-light focus:ring-skyhook-500'
+                )}
+              />
+              <button
+                type="button"
+                onClick={() => setRegexMode((v) => !v)}
+                aria-pressed={regexMode}
+                aria-label={regexMode ? 'Disable regex search' : 'Enable regex search'}
+                title={regexMode ? 'Regex search enabled — click to disable' : 'Enable regex search'}
+                className={clsx(
+                  'absolute right-2 top-1/2 -translate-y-1/2 flex items-center justify-center w-6 h-6 rounded transition-colors',
+                  regexMode
+                    ? 'bg-skyhook-500/20 text-skyhook-400'
+                    : 'text-theme-text-tertiary hover:text-theme-text-primary hover:bg-theme-hover'
+                )}
+              >
+                <Regex className="w-3.5 h-3.5" />
+              </button>
+              {searchRegex.error && (
+                <div
+                  title={searchRegex.error}
+                  className="absolute left-0 top-full mt-1 z-10 px-2 py-1 rounded bg-theme-elevated border border-red-500/40 text-[11px] text-red-400 shadow-theme-sm"
+                >
+                  Invalid regex pattern
+                </div>
+              )}
+            </div>
           </div>
 
           {/* Problems dropdown (pods only) */}
@@ -3468,12 +3872,20 @@ export function ResourcesView({
             </span>
           )}
 
-          {lastUpdated && (
-            <div className="flex items-center gap-1.5 text-xs text-theme-text-tertiary">
-              <Clock className="w-3.5 h-3.5" />
-              <span>Updated <span className="inline-block min-w-[4ch] tabular-nums">{formatAge(lastUpdated.toISOString())}</span></span>
-            </div>
+          {hasAnyFilter && (
+            <Tooltip content={!!onClearNamespaces && namespaces.length > 0 ? 'Reset all filters and the active namespace' : 'Reset all filters'}>
+              <button
+                type="button"
+                onClick={clearAllFilters}
+                className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs text-theme-text-secondary hover:text-theme-text-primary hover:bg-theme-elevated transition-colors"
+              >
+                <RotateCcw className="w-3.5 h-3.5" />
+                <span>Clear filters</span>
+              </button>
+            </Tooltip>
           )}
+
+          {lastUpdated && <LastUpdatedLabel lastUpdated={lastUpdated} />}
           {/* Column picker */}
           <div className="relative" ref={columnPickerRef}>
             <button
@@ -3546,11 +3958,27 @@ export function ResourcesView({
               </button>
             </Tooltip>
           )}
+          {compareEnabled && (
+            <Tooltip content={compareMode ? 'Exit compare mode' : 'Compare two resources side-by-side'}>
+              <button
+                onClick={() => (compareMode ? exitCompareMode() : setCompareMode(true))}
+                aria-pressed={compareMode}
+                className={clsx(
+                  'p-2 rounded-lg transition-colors',
+                  compareMode
+                    ? 'bg-skyhook-500/15 text-skyhook-300 border border-skyhook-400/50'
+                    : 'text-theme-text-secondary hover:text-theme-text-primary hover:bg-theme-elevated',
+                )}
+              >
+                <GitCompare className="w-4 h-4" />
+              </button>
+            </Tooltip>
+          )}
         </div>
 
         {/* Table */}
         <div
-          className="flex-1 overflow-y-auto overflow-x-hidden relative"
+          className="flex-1 overflow-auto relative"
           ref={tableContainerRef}
           onClick={(e) => {
             if (e.target === e.currentTarget && selectedResource) {
@@ -3578,23 +4006,6 @@ export function ResourcesView({
                   <X className="w-3.5 h-3.5" />
                 </button>
               )}
-              {/*
-                The sidebar's count badge shows the cluster-wide
-                total for the selected kind (from resourceCounts) and
-                deliberately stays unfiltered. When a search yields
-                zero results the user can think the badge is lying.
-                Spell out that the badge is the cluster total, not
-                the filtered count.
-              */}
-              {searchTerm && (() => {
-                const totalForKind = counts[selectedKind.group ? `${selectedKind.group}/${selectedKind.kind}` : selectedKind.kind] ?? 0
-                if (totalForKind === 0) return null
-                return (
-                  <p className="text-xs mt-1 text-theme-text-disabled">
-                    The sidebar shows {pluralize(totalForKind, selectedKind.kind)} in the cluster — the count is unfiltered.
-                  </p>
-                )
-              })()}
               {namespaces.length > 0 && <p className="text-sm mt-1 text-theme-text-disabled">Searching in {namespaces.length === 1 ? `namespace: ${namespaces[0]}` : `${namespaces.length} namespaces`}</p>}
               {/* Show active filters as dismissible badges so user can clear them */}
               {(() => {
@@ -3636,6 +4047,16 @@ export function ResourcesView({
                   </div>
                 )
               })()}
+              {hasAnyFilter && (
+                <button
+                  type="button"
+                  onClick={clearAllFilters}
+                  className="flex items-center gap-1.5 mt-3 px-3 py-1.5 text-sm rounded-md bg-theme-elevated hover:bg-theme-border text-theme-text-secondary hover:text-theme-text-primary transition-colors"
+                >
+                  <RotateCcw className="w-3.5 h-3.5" />
+                  Clear filters
+                </button>
+              )}
             </div>
           ) : (
             <MetricsContext.Provider value={metricsLookup}>
@@ -3648,8 +4069,20 @@ export function ResourcesView({
               components={virtuosoComponents}
               fixedHeaderContent={() => (
                 <tr>
+                  {compareMode && (
+                    <th
+                      // Inline px width — under `table-layout:fixed`,
+                      // `w-9` is a hint the browser absorbs into leftover
+                      // row width on an icon-only column.
+                      style={COMPARE_COLUMN_STYLE}
+                      className="px-2 py-3 text-xs font-medium uppercase tracking-wide bg-theme-base border-b border-r-subtle border-theme-border text-center text-skyhook-400"
+                      title="Compare mode"
+                    >
+                      <GitCompare className="w-3.5 h-3.5 inline-block opacity-70" />
+                    </th>
+                  )}
                   {columns.map((col, colIdx) => {
-                    const isSortable = ['name', 'namespace', 'age', 'status', 'ready', 'restarts', 'type', 'version', 'desired', 'available', 'upToDate', 'lastSeen', 'count', 'reason', 'object', 'cpu', 'memory'].includes(col.key)
+                    const isSortable = ['name', 'namespace', 'age', 'status', 'ready', 'restarts', 'type', 'version', 'desired', 'available', 'upToDate', 'lastSeen', 'count', 'reason', 'object', 'cpu', 'memory', 'containers'].includes(col.key)
                     const isSorted = sortColumn === col.key
                     const isLastCol = colIdx === columns.length - 1
                     const filterCol = filterableColumnMap.get(col.key)
@@ -3707,7 +4140,7 @@ export function ResourcesView({
                                     ? 'px-1.5 py-0.5 -my-0.5 selection-strong selection-text hover:bg-skyhook-500/30'
                                     : isFilterOpen
                                       ? 'p-0.5 text-theme-text-primary'
-                                      : 'p-0.5 text-theme-text-disabled opacity-0 group-hover/th:opacity-100 hover:text-theme-text-primary'
+                                      : 'p-0.5 text-theme-text-disabled opacity-40 group-hover/th:opacity-100 hover:text-theme-text-primary'
                                 )}
                               >
                                 <ListFilter className="w-3 h-3" />
@@ -3819,6 +4252,13 @@ export function ResourcesView({
                   selectedResource?.namespace === resource.metadata?.namespace &&
                   selectedResource?.name === resource.metadata?.name
                 const isHighlighted = index === highlightedIndex
+                const pickIdx = compareMode
+                  ? pickIndex(comparePicks, {
+                      namespace: resource.metadata?.namespace || '',
+                      name: resource.metadata?.name || '',
+                      clusterId: resolveRowCluster?.(resource)?.id,
+                    })
+                  : -1
                 return (
                   <ResourceRowCells
                     resource={resource}
@@ -3830,8 +4270,11 @@ export function ResourcesView({
                     isSelected={isSelected}
                     isHighlighted={isHighlighted}
                     majorityNodeMinorVersion={majorityNodeMinorVersion}
-                    onClick={() => selectResource(resource, isSelected)}
+                    onClick={() => compareMode ? toggleComparePick(resource) : selectResource(resource, isSelected)}
                     onMouseEnter={() => setHighlightedIndex(-1)}
+                    compareMode={compareMode}
+                    comparePickIndex={pickIdx}
+                    rowHref={rowHrefFor?.(resource)}
                   />
                 )
               }}
@@ -3847,6 +4290,15 @@ export function ResourcesView({
             </MetricsContext.Provider>
           )}
         </div>
+        {compareMode && compareEnabled && (
+          <CompareTray
+            kind={selectedKind.name}
+            picks={comparePicks}
+            onRemove={(idx) => setComparePicks(prev => prev.filter((_, i) => i !== idx))}
+            onCompare={handleCompareNavigate}
+            onExit={exitCompareMode}
+          />
+        )}
       </div>
     </div>
     </ResourcesViewDataContext.Provider>
@@ -3865,27 +4317,87 @@ interface ResourceRowCellsProps {
   majorityNodeMinorVersion?: string
   onClick?: () => void
   onMouseEnter?: () => void
+  compareMode?: boolean
+  /** -1 when not picked; 0 = pick A; 1 = pick B. */
+  comparePickIndex?: number
+  /** When provided, the name cell renders as `<a href>` and the other
+   *  data cells drop their click handlers. The compare-mode chip column
+   *  is unaffected (still toggles picks). */
+  rowHref?: string
 }
 
-function ResourceRowCells({ resource, kind, group, columns, extraColumnsByKey, hasSpacerColumn, isSelected, isHighlighted, majorityNodeMinorVersion, onClick, onMouseEnter }: ResourceRowCellsProps) {
+function rowHighlightClass(
+  compareMode: boolean | undefined,
+  comparePickIndex: number,
+  isSelected: boolean | undefined,
+  isHighlighted: boolean | undefined,
+): string {
+  if (compareMode) {
+    if (comparePickIndex === 0) return `${SIDE_TONES.a.rowBg} ${SIDE_TONES.a.rowBgHover}`
+    if (comparePickIndex === 1) return `${SIDE_TONES.b.rowBg} ${SIDE_TONES.b.rowBgHover}`
+    if (isHighlighted) return 'selection selection-ring'
+    return 'group-hover/row:bg-theme-surface/50'
+  }
+  if (isSelected) return 'selection-strong group-hover/row:bg-skyhook-500/30'
+  if (isHighlighted) return 'selection selection-ring'
+  return 'group-hover/row:bg-theme-surface/50'
+}
+
+function ResourceRowCells({ resource, kind, group, columns, extraColumnsByKey, hasSpacerColumn, isSelected, isHighlighted, majorityNodeMinorVersion, onClick, onMouseEnter, compareMode, comparePickIndex = -1, rowHref }: ResourceRowCellsProps) {
+  const rowHighlight = rowHighlightClass(compareMode, comparePickIndex, isSelected, isHighlighted)
+  const pickedSide = comparePickIndex === 0 ? 'a' : comparePickIndex === 1 ? 'b' : null
+  // When the host supplies an anchor, drop per-cell onClick for the data
+  // columns: the anchor is the only navigation surface. The compare-mode
+  // chip column keeps its onClick so pick toggling still works.
+  const cellsAreClickable = !rowHref
   return (
     <>
+      {compareMode && (
+        <td
+          onClick={onClick}
+          onMouseEnter={onMouseEnter}
+          style={COMPARE_COLUMN_STYLE}
+          className={clsx('px-2 py-3 border-b-subtle cursor-pointer text-center align-middle transition-colors', rowHighlight)}
+        >
+          {pickedSide ? (
+            <span
+              className={clsx(
+                'inline-flex items-center justify-center w-5 h-5 rounded text-[10px] font-bold leading-none',
+                SIDE_TONES[pickedSide].chipBg,
+              )}
+              aria-label={pickedSide === 'a' ? 'Pick A' : 'Pick B'}
+            >
+              {pickedSide === 'a' ? 'A' : 'B'}
+            </span>
+          ) : (
+            <span
+              className="inline-block w-4 h-4 rounded border border-theme-border-light group-hover/row:border-skyhook-400/60 transition-colors"
+              aria-hidden
+            />
+          )}
+        </td>
+      )}
       {columns.map((col) => (
         <td
           key={col.key}
-          onClick={onClick}
+          onClick={cellsAreClickable ? onClick : undefined}
           onMouseEnter={onMouseEnter}
           className={clsx(
-            'px-4 py-3 border-b-subtle cursor-pointer transition-colors',
+            'px-4 py-3 border-b-subtle transition-colors',
+            cellsAreClickable && 'cursor-pointer',
             col.key !== 'status' && 'overflow-hidden truncate',
-            isSelected
-              ? 'selection-strong group-hover/row:bg-skyhook-500/30'
-              : isHighlighted
-                ? 'selection selection-ring'
-                : 'group-hover/row:bg-theme-surface/50'
+            rowHighlight,
           )}
         >
-          <CellContent resource={resource} kind={kind} group={group} column={col.key} majorityNodeMinorVersion={majorityNodeMinorVersion} extraColumn={extraColumnsByKey?.get(col.key)} />
+          <CellContent
+            resource={resource}
+            kind={kind}
+            group={group}
+            column={col.key}
+            majorityNodeMinorVersion={majorityNodeMinorVersion}
+            extraColumn={extraColumnsByKey?.get(col.key)}
+            nameHref={col.key === 'name' ? rowHref : undefined}
+          />
         </td>
       ))}
       {hasSpacerColumn && <td className="border-b-subtle p-0" />}
@@ -3929,9 +4441,12 @@ interface CellContentProps {
    *  column key. Render via the extra's render() and short-circuit
    *  the built-in cell logic. */
   extraColumn?: ExtraColumn
+  /** When set on the name column, the resource name renders as `<a href>`
+   *  so ⌘-click / copy-link / hover-URL all work. */
+  nameHref?: string
 }
 
-function CellContent({ resource, kind, column, group, majorityNodeMinorVersion, extraColumn }: CellContentProps) {
+function CellContent({ resource, kind, column, group, majorityNodeMinorVersion, extraColumn, nameHref }: CellContentProps) {
   // Parent-injected extra columns short-circuit the built-in switch.
   // Used by hosts that inject leading columns (e.g. a multi-cluster Cluster column).
   if (extraColumn) {
@@ -3943,12 +4458,22 @@ function CellContent({ resource, kind, column, group, majorityNodeMinorVersion, 
   // Common columns
   if (column === 'name') {
     const isTerminating = !!meta.deletionTimestamp
+    const nameClass = clsx('text-sm font-medium truncate block', isTerminating ? 'text-theme-text-tertiary line-through' : 'text-theme-text-primary')
     return (
       <div className="flex items-center gap-1.5 min-w-0">
         <Tooltip content={meta.name}>
-          <span className={clsx('text-sm font-medium truncate block', isTerminating ? 'text-theme-text-tertiary line-through' : 'text-theme-text-primary')}>
-            {meta.name}
-          </span>
+          {nameHref ? (
+            <a
+              href={nameHref}
+              className={clsx(nameClass, 'hover:underline focus-visible:underline focus-visible:outline-none rounded-sm')}
+            >
+              {meta.name}
+            </a>
+          ) : (
+            <span className={nameClass}>
+              {meta.name}
+            </span>
+          )}
         </Tooltip>
         <CopyNameButton name={meta.name} />
         {isTerminating && (
@@ -3970,7 +4495,14 @@ function CellContent({ resource, kind, column, group, majorityNodeMinorVersion, 
     )
   }
   if (column === 'age') {
-    return <span className="text-sm text-theme-text-secondary">{formatAge(meta.creationTimestamp)}</span>
+    if (!meta.creationTimestamp) {
+      return <span className="text-sm text-theme-text-secondary">-</span>
+    }
+    return (
+      <Tooltip content={new Date(meta.creationTimestamp).toLocaleString()}>
+        <span className="text-sm text-theme-text-secondary">{formatAge(meta.creationTimestamp)}</span>
+      </Tooltip>
+    )
   }
 
   // Kind-specific columns (normalize CRD singular names like 'ScaledObject' → 'scaledobjects')
@@ -3987,6 +4519,8 @@ function CellContent({ resource, kind, column, group, majorityNodeMinorVersion, 
       return <ReplicaSetCell resource={resource} column={column} />
     case 'services':
       return <ServiceCell resource={resource} column={column} />
+    case 'endpointslices':
+      return <EndpointSliceCell resource={resource} column={column} />
     case 'ingresses':
       return <IngressCell resource={resource} column={column} />
     case 'configmaps':
@@ -4296,7 +4830,29 @@ function CellContent({ resource, kind, column, group, majorityNodeMinorVersion, 
       return <AzureMachineTemplateCell resource={resource} column={column} />
     case 'azuremanagedclusters':
       return <AzureManagedClusterCell resource={resource} column={column} />
+    // Crossplane
+    case 'providers':
+      // Disambiguate from any future kind named "providers" by checking group
+      if (resource.apiVersion?.startsWith('pkg.crossplane.io/')) {
+        return <CrossplaneProviderCell resource={resource} column={column} />
+      }
+      return <GenericCell resource={resource} column={column} />
+    case 'providerconfigs':
+      return <CrossplaneProviderConfigCell resource={resource} column={column} />
+    case 'compositions':
+      return <CompositionCell resource={resource} column={column} />
+    case 'compositeresourcedefinitions':
+      return <XRDCell resource={resource} column={column} />
     default:
+      // Crossplane Managed Resources: unbounded plurals (one CRD per provider
+      // service), detected via group prefix + spec.providerConfigRef heuristic.
+      if (isLikelyCrossplaneMRGroup(kind, group ?? '') && isManagedResource(resource)) {
+        return <ManagedResourceCell resource={resource} column={column} />
+      }
+      // Composite Resources (XRs) — user-defined kinds with resourceRefs.
+      if (isComposite(resource)) {
+        return <CompositeResourceCell resource={resource} column={column} />
+      }
       // Generic cell for CRDs and unknown resources
       return <GenericCell resource={resource} column={column} />
   }
@@ -4372,7 +4928,7 @@ function PodCell({ resource, column }: { resource: any; column: string }) {
       const squares = getContainerSquareStates(resource)
       const hasInit = squares.some(s => s.isInit)
       return (
-        <div className="flex items-center gap-1">
+        <div className="flex w-full items-center justify-center gap-1">
           {squares.map((sq, i) => {
             const showSeparator = hasInit && i > 0 && sq.isInit !== squares[i - 1].isInit
             const bgClass =
@@ -4783,6 +5339,56 @@ function ServiceCell({ resource, column }: { resource: any; column: string }) {
     case 'ports': {
       const ports = getServicePorts(resource)
       return <span className="text-sm text-theme-text-secondary">{ports}</span>
+    }
+    default:
+      return <span className="text-sm text-theme-text-tertiary">-</span>
+  }
+}
+
+function getEndpointSliceReadyCount(resource: any): number {
+  return (resource.endpoints || []).filter((endpoint: any) => endpoint?.conditions?.ready !== false).length
+}
+
+function getEndpointSliceAddressCount(resource: any): number {
+  return (resource.endpoints || []).reduce((total: number, endpoint: any) => total + (endpoint.addresses?.length || 0), 0)
+}
+
+function getEndpointSlicePorts(resource: any): string {
+  const ports = resource.ports || []
+  if (ports.length === 0) return '-'
+  return ports.map((port: any) => {
+    const name = port.name || 'unnamed'
+    const protocol = port.protocol || 'TCP'
+    return `${name}:${port.port ?? '-'}${protocol !== 'TCP' ? `/${protocol}` : ''}`
+  }).join(', ')
+}
+
+function EndpointSliceCell({ resource, column }: { resource: any; column: string }) {
+  switch (column) {
+    case 'service': {
+      const service = resource.metadata?.labels?.['kubernetes.io/service-name']
+      return <span className="text-sm text-theme-text-secondary truncate">{service || '-'}</span>
+    }
+    case 'addressType':
+      return <span className="text-sm text-theme-text-secondary">{resource.addressType || '-'}</span>
+    case 'endpoints': {
+      const total = resource.endpoints?.length || 0
+      const ready = getEndpointSliceReadyCount(resource)
+      const color = total === 0 ? SEVERITY_BADGE.neutral :
+        ready === total ? SEVERITY_BADGE.success :
+        ready > 0 ? SEVERITY_BADGE.warning :
+        SEVERITY_BADGE.error
+      return <span className={clsx('badge', color)}>{ready}/{total}</span>
+    }
+    case 'addresses':
+      return <span className="text-sm text-theme-text-secondary">{getEndpointSliceAddressCount(resource)}</span>
+    case 'ports': {
+      const ports = getEndpointSlicePorts(resource)
+      return (
+        <Tooltip content={ports}>
+          <span className="text-sm text-theme-text-secondary truncate">{ports}</span>
+        </Tooltip>
+      )
     }
     default:
       return <span className="text-sm text-theme-text-tertiary">-</span>
@@ -5716,6 +6322,3 @@ function EventCell({ resource, column }: { resource: any; column: string }) {
       return <span className="text-sm text-theme-text-tertiary">-</span>
   }
 }
-
-
-

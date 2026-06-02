@@ -1,4 +1,4 @@
-import { GitBranch, FolderTree, Settings, Target, XCircle, History, ListChecks } from 'lucide-react'
+import { GitBranch, FolderTree, Settings, Target, XCircle, History, ListChecks, ExternalLink } from 'lucide-react'
 import { clsx } from 'clsx'
 import { Section, PropertyList, Property, ConditionsSection, ProblemAlerts } from '../../ui/drawer-components'
 import { formatAge } from '../resource-utils'
@@ -10,6 +10,9 @@ import {
   type ArgoResource,
 } from '../../../types/gitops'
 import { BADGE_INACTIVE } from '../../../utils/badge-colors'
+import { buildRepoBrowseUrl, buildPathBrowseUrl } from '../../../utils/git-provider-urls'
+
+const REPO_LINK_CLASS = 'text-blue-400 hover:text-blue-300 hover:underline break-all'
 
 interface ArgoApplicationRendererProps {
   data: any
@@ -19,10 +22,51 @@ interface ArgoApplicationRendererProps {
 
 function SourceProperties({ source }: { source: any }) {
   if (!source) return null
+  // Helm chart sources point repoURL at a chart registry, not a browseable git repo.
+  const isHelmSource = !!source.chart
+  const repoHref = isHelmSource ? null : buildRepoBrowseUrl(source.repoURL)
+  const pathHref = isHelmSource ? null : buildPathBrowseUrl(source.repoURL, source.path, source.targetRevision)
   return (
     <>
-      <Property label="Repository" value={source.repoURL} />
-      {source.path && <Property label="Path" value={source.path} />}
+      <Property
+        label="Repository"
+        value={
+          repoHref ? (
+            <a
+              href={repoHref}
+              target="_blank"
+              rel="noopener noreferrer"
+              title={source.repoURL}
+              className={`${REPO_LINK_CLASS} inline-flex items-center gap-1`}
+            >
+              {source.repoURL}
+              <ExternalLink className="w-3 h-3 shrink-0" />
+            </a>
+          ) : (
+            source.repoURL
+          )
+        }
+      />
+      {source.path && (
+        <Property
+          label="Path"
+          value={
+            pathHref ? (
+              <a
+                href={pathHref}
+                target="_blank"
+                rel="noopener noreferrer"
+                title={source.path}
+                className={REPO_LINK_CLASS}
+              >
+                {source.path}
+              </a>
+            ) : (
+              source.path
+            )
+          }
+        />
+      )}
       {source.targetRevision && (
         <Property
           label="Target Revision"

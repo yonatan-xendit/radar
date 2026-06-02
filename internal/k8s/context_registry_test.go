@@ -277,8 +277,8 @@ func TestKubeconfigSourceLabel(t *testing.T) {
 		// Relative paths — SourceFile is normalised to absolute upstream,
 		// but pin the helper's behaviour so a future drift doesn't sneak
 		// silently past callers like aggregateExecPluginCommands.
-		{"config", "config"},                  // no parent
-		{"./config", "config"},                // current-dir parent rejected
+		{"config", "config"},                                // no parent
+		{"./config", "config"},                              // current-dir parent rejected
 		{"kube-cluster-paris/config", "kube-cluster-paris"}, // relative parent honored
 	}
 	for _, c := range cases {

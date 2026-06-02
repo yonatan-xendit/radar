@@ -2,8 +2,10 @@ package timeline
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -30,6 +32,18 @@ func createTestSQLiteStore(t *testing.T) (*SQLiteStore, func()) {
 	}
 
 	return store, cleanup
+}
+
+func sqliteFileSize(t *testing.T, path string) int64 {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0
+		}
+		t.Fatalf("stat %s: %v", path, err)
+	}
+	return info.Size()
 }
 
 func TestSQLiteStore_Append(t *testing.T) {
@@ -453,5 +467,415 @@ func TestSQLiteStore_LabelsStorage(t *testing.T) {
 	}
 	if result.GetAppLabel() != "myapp" {
 		t.Errorf("Expected GetAppLabel()='myapp', got '%s'", result.GetAppLabel())
+	}
+}
+
+func TestSQLiteStore_SeenResources_PersistAcrossRestart(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "timeline-seen-persist-*")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+	dbPath := filepath.Join(tmpDir, "seen.db")
+
+	store1, err := NewSQLiteStore(dbPath)
+	if err != nil {
+		t.Fatalf("NewSQLiteStore: %v", err)
+	}
+	store1.MarkResourceSeen("Pod", "default", "p1")
+	store1.MarkResourceSeen("Deployment", "kube-system", "d1")
+	store1.Close()
+
+	store2, err := NewSQLiteStore(dbPath)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer store2.Close()
+
+	if !store2.IsResourceSeen("Pod", "default", "p1") {
+		t.Error("expected Pod default/p1 to be seen after restart")
+	}
+	if !store2.IsResourceSeen("Deployment", "kube-system", "d1") {
+		t.Error("expected Deployment kube-system/d1 to be seen after restart")
+	}
+	if store2.IsResourceSeen("Pod", "default", "never-marked") {
+		t.Error("did not expect unmarked resource to be seen")
+	}
+}
+
+func TestGetDiagnosis_WithSQLiteStore(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "timeline-diagnose-*")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	ResetStore()
+	defer ResetStore()
+
+	dbPath := filepath.Join(tmpDir, "diagnose.db")
+	if err := InitStore(StoreConfig{Type: StoreTypeSQLite, Path: dbPath}); err != nil {
+		t.Fatalf("InitStore: %v", err)
+	}
+
+	event := TimelineEvent{
+		ID:        "event-1",
+		Timestamp: time.Now(),
+		Source:    SourceInformer,
+		Kind:      "TimelineWidget",
+		Namespace: "radar-timeline-test",
+		Name:      "noise-check",
+		EventType: EventTypeUpdate,
+	}
+	if err := RecordEvent(context.Background(), event); err != nil {
+		t.Fatalf("RecordEvent: %v", err)
+	}
+
+	resp := GetDiagnosis("TimelineWidget", "radar-timeline-test", "noise-check")
+	if !resp.StorePresent {
+		t.Fatal("expected diagnostics to see the global store")
+	}
+	if len(resp.TimelineEvents) != 1 {
+		t.Fatalf("expected one matching event, got %d: %+v", len(resp.TimelineEvents), resp.TimelineEvents)
+	}
+	if resp.TimelineEvents[0].ID != event.ID {
+		t.Fatalf("diagnosis returned wrong event: got %q want %q", resp.TimelineEvents[0].ID, event.ID)
+	}
+}
+
+func TestSQLiteStore_Stats_RecordsCleanupState(t *testing.T) {
+	store, cleanup := createTestSQLiteStore(t)
+	defer cleanup()
+
+	if got := store.Stats(); !got.LastCleanupAt.IsZero() || got.RetentionAge != 0 {
+		t.Errorf("expected zero cleanup state before StartCleanupLoop, got %+v", got)
+	}
+
+	ctx := context.Background()
+	old := TimelineEvent{
+		ID:        "old",
+		Timestamp: time.Now().Add(-2 * time.Hour),
+		Source:    SourceInformer,
+		Kind:      "Pod",
+		Namespace: "default",
+		Name:      "old-pod",
+		EventType: EventTypeAdd,
+	}
+	if err := store.Append(ctx, old); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	store.StartCleanupLoop(time.Hour, time.Hour, 0)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		stats := store.Stats()
+		if !stats.LastCleanupAt.IsZero() {
+			if stats.RetentionAge != time.Hour {
+				t.Errorf("RetentionAge = %s, want 1h", stats.RetentionAge)
+			}
+			if stats.LastCleanupDeletedRows != 1 {
+				t.Errorf("LastCleanupDeletedRows = %d, want 1", stats.LastCleanupDeletedRows)
+			}
+			if stats.LastCleanupError != "" {
+				t.Errorf("LastCleanupError = %q, want empty", stats.LastCleanupError)
+			}
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("LastCleanupAt remained zero — cleanup state not recorded")
+}
+
+func TestSQLiteStore_PruneToMaxSize_DropsOldestEvents(t *testing.T) {
+	store, cleanup := createTestSQLiteStore(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	base := time.Now().Add(-time.Hour)
+	events := make([]TimelineEvent, 0, 300)
+	for i := range 300 {
+		events = append(events, TimelineEvent{
+			ID:        fmt.Sprintf("event-%03d", i),
+			Timestamp: base.Add(time.Duration(i) * time.Second),
+			Source:    SourceInformer,
+			Kind:      "TimelineWidget",
+			Namespace: "default",
+			Name:      "noise-check",
+			EventType: EventTypeUpdate,
+			Message:   strings.Repeat("x", 2048),
+		})
+	}
+	if err := store.AppendBatch(ctx, events); err != nil {
+		t.Fatalf("AppendBatch: %v", err)
+	}
+
+	if err := store.checkpointWAL(ctx); err != nil {
+		t.Fatalf("checkpointWAL: %v", err)
+	}
+	before := store.storageBytes()
+	deleted, err := store.PruneToMaxSize(ctx, before*9/10)
+	if err != nil {
+		t.Fatalf("PruneToMaxSize: %v", err)
+	}
+	if deleted == 0 {
+		t.Fatal("expected size pruning to delete old events")
+	}
+
+	got, err := store.Query(ctx, QueryOptions{Limit: 1000, IncludeManaged: true})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if len(got) >= len(events) {
+		t.Fatalf("expected fewer than %d events after pruning, got %d", len(events), len(got))
+	}
+	if len(got) == 0 || got[0].ID != "event-299" {
+		t.Fatalf("expected newest event to remain after pruning, got %+v", got)
+	}
+}
+
+func TestSQLiteStore_PruneToMaxSize_CanDeleteLastOversizedEvent(t *testing.T) {
+	store, cleanup := createTestSQLiteStore(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	maxBytes := store.storageBytes() + 128*1024
+	if err := store.Append(ctx, TimelineEvent{
+		ID:        "oversized",
+		Timestamp: time.Now(),
+		Source:    SourceInformer,
+		Kind:      "TimelineWidget",
+		Namespace: "default",
+		Name:      "noise-check",
+		EventType: EventTypeUpdate,
+		Message:   strings.Repeat("x", 2*1024*1024),
+	}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if store.storageBytes() <= maxBytes {
+		t.Fatalf("test setup did not exceed max size: storage=%d max=%d", store.storageBytes(), maxBytes)
+	}
+
+	deleted, err := store.PruneToMaxSize(ctx, maxBytes)
+	if err != nil {
+		t.Fatalf("PruneToMaxSize: %v", err)
+	}
+	if deleted != 1 {
+		t.Fatalf("deleted = %d, want 1", deleted)
+	}
+	got, err := store.Query(ctx, QueryOptions{Limit: 10, IncludeManaged: true})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("expected oversized event to be pruned, got %+v", got)
+	}
+	if storage := store.storageBytes(); storage > maxBytes {
+		t.Fatalf("storage still above max after pruning: %d > %d", storage, maxBytes)
+	}
+}
+
+func TestSQLiteStore_RunCleanup_CheckpointsWALForRetentionOnly(t *testing.T) {
+	store, cleanup := createTestSQLiteStore(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	events := make([]TimelineEvent, 0, 300)
+	for i := range 300 {
+		events = append(events, TimelineEvent{
+			ID:        fmt.Sprintf("event-%03d", i),
+			Timestamp: time.Now(),
+			Source:    SourceInformer,
+			Kind:      "TimelineWidget",
+			Namespace: "default",
+			Name:      "noise-check",
+			EventType: EventTypeUpdate,
+			Message:   strings.Repeat("x", 2048),
+		})
+	}
+	if err := store.AppendBatch(ctx, events); err != nil {
+		t.Fatalf("AppendBatch: %v", err)
+	}
+	walBefore := sqliteFileSize(t, store.path+"-wal")
+	if walBefore == 0 {
+		t.Fatal("test setup did not create a WAL file")
+	}
+
+	store.runCleanup(time.Hour, 0)
+
+	if walAfter := sqliteFileSize(t, store.path+"-wal"); walAfter != 0 {
+		t.Fatalf("expected retention cleanup to truncate WAL, before=%d after=%d", walBefore, walAfter)
+	}
+}
+
+func TestSQLiteStore_StartCleanupLoop_PrunesByMaxSizeWithoutRetention(t *testing.T) {
+	store, cleanup := createTestSQLiteStore(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	base := time.Now().Add(-time.Hour)
+	events := make([]TimelineEvent, 0, 300)
+	for i := range 300 {
+		events = append(events, TimelineEvent{
+			ID:        fmt.Sprintf("event-%03d", i),
+			Timestamp: base.Add(time.Duration(i) * time.Second),
+			Source:    SourceInformer,
+			Kind:      "TimelineWidget",
+			Namespace: "default",
+			Name:      "noise-check",
+			EventType: EventTypeUpdate,
+			Message:   strings.Repeat("x", 2048),
+		})
+	}
+	if err := store.AppendBatch(ctx, events); err != nil {
+		t.Fatalf("AppendBatch: %v", err)
+	}
+
+	before := store.storageBytes()
+	store.StartCleanupLoop(0, time.Hour, before*9/10)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		stats := store.Stats()
+		if stats.LastCleanupDeletedRows > 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	t.Fatal("max-size-only cleanup did not prune events")
+}
+
+func TestSQLiteStore_StartCleanupLoop_RunsImmediately(t *testing.T) {
+	// Use an interval far longer than the test window so the only way
+	// the old event can be deleted within the deadline is the eager
+	// pre-ticker run. Catches a regression where someone moves the
+	// runCleanup call back inside the for-loop / below the case branch.
+	store, cleanup := createTestSQLiteStore(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	old := TimelineEvent{
+		ID:        "old",
+		Timestamp: time.Now().Add(-2 * time.Hour),
+		Source:    SourceInformer,
+		Kind:      "Pod",
+		Namespace: "default",
+		Name:      "old-pod",
+		EventType: EventTypeAdd,
+	}
+	if err := store.Append(ctx, old); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	store.StartCleanupLoop(time.Hour, time.Hour, 0)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		events, err := store.Query(ctx, QueryOptions{Limit: 10, IncludeManaged: true})
+		if err != nil {
+			t.Fatalf("Query: %v", err)
+		}
+		if len(events) == 0 {
+			return // eager cleanup ran
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("eager cleanup did not run within 2s — old event still present")
+}
+
+func TestSQLiteStore_StartCleanupLoop_RunsAndStopsOnClose(t *testing.T) {
+	store, cleanup := createTestSQLiteStore(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	old := TimelineEvent{
+		ID:        "old",
+		Timestamp: time.Now().Add(-2 * time.Hour),
+		Source:    SourceInformer,
+		Kind:      "Pod",
+		Namespace: "default",
+		Name:      "old-pod",
+		EventType: EventTypeAdd,
+	}
+	fresh := TimelineEvent{
+		ID:        "fresh",
+		Timestamp: time.Now(),
+		Source:    SourceInformer,
+		Kind:      "Pod",
+		Namespace: "default",
+		Name:      "fresh-pod",
+		EventType: EventTypeAdd,
+	}
+	if err := store.AppendBatch(ctx, []TimelineEvent{old, fresh}); err != nil {
+		t.Fatalf("AppendBatch: %v", err)
+	}
+
+	store.StartCleanupLoop(time.Hour, 20*time.Millisecond, 0)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		events, err := store.Query(ctx, QueryOptions{Limit: 10, IncludeManaged: true})
+		if err != nil {
+			t.Fatalf("Query: %v", err)
+		}
+		if len(events) == 1 && events[0].ID == "fresh" {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	events, _ := store.Query(ctx, QueryOptions{Limit: 10, IncludeManaged: true})
+	if len(events) != 1 || events[0].ID != "fresh" {
+		t.Fatalf("expected only the fresh event after cleanup, got %d: %+v", len(events), events)
+	}
+
+	// Close must return promptly — proves the cleanup goroutine exited.
+	done := make(chan error, 1)
+	go func() { done <- store.Close() }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close did not return within 2s — cleanup goroutine leaked")
+	}
+
+	// And idempotent — the deferred cleanup() will Close again.
+}
+
+func TestSQLiteStore_StartCleanupLoop_ZeroIsNoop(t *testing.T) {
+	cases := []struct {
+		name      string
+		retention time.Duration
+		interval  time.Duration
+		maxBytes  int64
+	}{
+		{"zero retention and max size", 0, time.Hour, 0},
+		{"zero interval", time.Hour, 0, 1024},
+		{"both cleanup modes disabled", 0, time.Hour, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tmpDir, err := os.MkdirTemp("", "timeline-noop-*")
+			if err != nil {
+				t.Fatalf("MkdirTemp: %v", err)
+			}
+			defer os.RemoveAll(tmpDir)
+
+			store, err := NewSQLiteStore(filepath.Join(tmpDir, "test.db"))
+			if err != nil {
+				t.Fatalf("NewSQLiteStore: %v", err)
+			}
+
+			store.StartCleanupLoop(tc.retention, tc.interval, tc.maxBytes)
+
+			done := make(chan error, 1)
+			go func() { done <- store.Close() }()
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Fatal("Close blocked — goroutine started despite zero param")
+			}
+		})
 	}
 }

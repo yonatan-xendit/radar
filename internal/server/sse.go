@@ -9,9 +9,11 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/skyhook-io/radar/internal/k8s"
+	"github.com/skyhook-io/radar/pkg/perfstats"
 	topology "github.com/skyhook-io/radar/pkg/topology"
 )
 
@@ -25,6 +27,15 @@ type SSEBroadcaster struct {
 	unregister chan chan SSEEvent
 	mu         sync.RWMutex
 	stopCh     chan struct{}
+
+	// lastBroadcastMaxEstimated holds the max EstimatedNodes across all
+	// per-group topology builds in the most recent broadcast cycle. Drives
+	// the debounce ladder (see topologyDebounceFor). It reflects only the
+	// currently-active client groups: a sample window over recent builds
+	// would let a brief visit to a big namespace keep the debounce
+	// sticky-high long after the user filtered to a small one, whereas this
+	// settles within one cycle of a namespace switch.
+	lastBroadcastMaxEstimated atomic.Int64
 
 	// watchStopCh is closed to stop the current watchResourceChanges goroutine.
 	// On context switch, it is replaced with a fresh channel to restart the watcher.
@@ -62,6 +73,45 @@ type SSEEvent struct {
 	Data  any    `json:"data"`
 }
 
+// topologyDebounceFor returns the topology-broadcast debounce duration based
+// on the max estimated topology node count across the most recent broadcast
+// cycle's per-group builds. Falls back to a crude derivation from total
+// resource count before the first broadcast (or when all clients have been
+// disconnected for an entire cycle).
+//
+// Ladder: ≤500 → 1s, ≤2000 → 2s, ≤5000 → 5s, >5000 → 15s. Minimum is 1s by
+// design — even at the smallest cluster scale we don't need faster topology
+// refreshes than that, and SSE k8s_event frames (which fire immediately, not
+// on this debounce) cover the case where the user wants to see individual
+// resource state changes in real time.
+//
+// The lastBroadcastMaxEstimated input reflects only currently-active client
+// groups, which means a namespace switch settles within one debounce cycle
+// (the next broadcast updates the value, and the cycle after that uses the
+// fresh value). A max taken over a sample window of recent builds would
+// instead keep a brief stint on a big namespace visible for many cycles
+// after the user switched away.
+func topologyDebounceFor(lastBroadcastMaxEstimated int64, cache interface{ GetResourceCount() int }) time.Duration {
+	estimated := lastBroadcastMaxEstimated
+	if estimated == 0 && cache != nil {
+		// No broadcasts recorded yet, or no clients connected during the
+		// last cycle. Use raw resource count divided by 5 as a crude proxy —
+		// most resources don't become topology nodes (events, secrets,
+		// configmaps).
+		estimated = int64(cache.GetResourceCount()) / 5
+	}
+	switch {
+	case estimated > 5000:
+		return 15 * time.Second
+	case estimated > 2000:
+		return 5 * time.Second
+	case estimated > 500:
+		return 2 * time.Second
+	default:
+		return 1 * time.Second
+	}
+}
+
 // safeSend sends an event to a channel, recovering from panic if the channel is closed
 func safeSend(ch chan SSEEvent, event SSEEvent) {
 	defer func() {
@@ -70,7 +120,9 @@ func safeSend(ch chan SSEEvent, event SSEEvent) {
 	select {
 	case ch <- event:
 	default:
-		// Channel full, skip
+		// Channel full, skip. Counted in perfstats so users can see drops
+		// in /api/diagnostics without enabling any flag.
+		perfstats.IncSSEDrop()
 	}
 }
 
@@ -412,14 +464,16 @@ func (b *SSEBroadcaster) watchResourceChanges() {
 	//   jump on every arrival, so we coalesce into 5s windows. The UI is
 	//   already on the home view by this point with a "loading more" hint;
 	//   the slight delay is preferable to a fidgety graph.
-	// - After warmup: re-evaluate based on cluster size. Large clusters (>5000
-	//   resources) use 5s; smaller clusters use 500ms.
+	// - After warmup: scale debounce by the estimated topology node count
+	//   from the most recent builds (the same signal driving the in-builder
+	//   large-cluster optimizations). Minimum 1s — even at small scale we
+	//   don't need faster topology refreshes than that.
 	const warmupDebounce = 5 * time.Second
-	debounceDuration := warmupDebounce
 	b.watchMu.Lock()
 	warmupCh := b.warmupDone // local copy under lock; nil-ed after firing to avoid closed-channel spin
 	b.watchMu.Unlock()
-	log.Printf("SSE watcher: using %v warmup debounce until initial sync completes", debounceDuration)
+	warmupComplete := false
+	log.Printf("SSE watcher: using %v warmup debounce until initial sync completes", warmupDebounce)
 
 	debounceTimer := time.NewTimer(0)
 	<-debounceTimer.C // drain initial timer
@@ -434,15 +488,9 @@ func (b *SSEBroadcaster) watchResourceChanges() {
 			return
 
 		case <-warmupCh:
-			// Warmup complete — re-evaluate debounce based on actual cluster size
 			warmupCh = nil // prevent closed-channel spin on next iteration
-			resourceCount := cache.GetResourceCount()
-			if resourceCount > 5000 {
-				debounceDuration = 5 * time.Second
-			} else {
-				debounceDuration = 500 * time.Millisecond
-			}
-			log.Printf("SSE watcher: warmup complete (%d resources), switching to %v debounce", resourceCount, debounceDuration)
+			warmupComplete = true
+			log.Printf("SSE watcher: warmup complete (%d resources), debounce now dynamic by estimated node count (min 1s)", cache.GetResourceCount())
 
 		case change, ok := <-changes:
 			if !ok {
@@ -472,9 +520,18 @@ func (b *SSEBroadcaster) watchResourceChanges() {
 				})
 			}
 
-			// Schedule debounced topology update
+			// Schedule debounced topology update. Re-evaluate debounce on
+			// every reset so a cluster that grows past a ladder threshold
+			// starts coalescing more aggressively without restart, and so
+			// a namespace switch (which changes the active client groups
+			// and therefore the next broadcast's max estimate) settles
+			// within one debounce cycle.
 			if !pendingUpdate {
-				debounceTimer.Reset(debounceDuration)
+				dur := warmupDebounce
+				if warmupComplete {
+					dur = topologyDebounceFor(b.lastBroadcastMaxEstimated.Load(), cache)
+				}
+				debounceTimer.Reset(dur)
 				pendingUpdate = true
 			}
 
@@ -506,10 +563,20 @@ func (b *SSEBroadcaster) broadcastTopologyUpdate() {
 		b.cachedTopologyMu.Lock()
 		b.cachedTopologyDirty = true
 		b.cachedTopologyMu.Unlock()
+		// Forget the last cycle's estimate so a future session doesn't inherit
+		// a disconnected session's debounce (a small namespace shouldn't keep a
+		// big one's 15s cadence). topologyDebounceFor falls back to the resource-
+		// count proxy until the next broadcast records a real estimate.
+		b.lastBroadcastMaxEstimated.Store(0)
 		return
 	}
 
 	log.Printf("Broadcasting topology update to %d clients", len(clients))
+
+	// One broadcast cycle = one debounce fire that reaches clients. Counted
+	// here (not in the per-group loop below) so the metric reflects cycles,
+	// not the number of distinct namespace/view/policy groups.
+	perfstats.IncSSEBroadcast()
 
 	// During warmup, skip the expensive full-topology cache build. Nobody is
 	// clicking into resource details while the connecting spinner is showing,
@@ -551,7 +618,13 @@ func (b *SSEBroadcaster) broadcastTopologyUpdate() {
 		clientGroups[key].channels = append(clientGroups[key].channels, ch)
 	}
 
-	// Build topology for each group and send
+	// Build topology for each group and send. Pre-marshal once per group so
+	// the same bytes go out to every client in the group (the per-client SSE
+	// writer would otherwise re-marshal the same large topology N times).
+	// Also gives us a single point to record payload bytes and the max
+	// estimated node count across active groups — the latter drives the
+	// next cycle's debounce ladder.
+	var maxEstimated int64
 	for key, group := range clientGroups {
 		opts := topology.DefaultBuildOptions()
 		opts.Namespaces = group.namespaces
@@ -566,15 +639,31 @@ func (b *SSEBroadcaster) broadcastTopologyUpdate() {
 			continue
 		}
 
+		if int64(topo.EstimatedNodes) > maxEstimated {
+			maxEstimated = int64(topo.EstimatedNodes)
+		}
+
+		data, marshalErr := json.Marshal(topo)
+		if marshalErr != nil {
+			log.Printf("Error marshaling topology for broadcast: %v", marshalErr)
+			continue
+		}
+		perfstats.RecordTopologyPayload(len(data))
+
 		event := SSEEvent{
 			Event: "topology",
-			Data:  topo,
+			Data:  json.RawMessage(data),
 		}
 
 		for _, ch := range group.channels {
 			safeSend(ch, event)
 		}
 	}
+
+	// Store the max for the next cycle's debounce decision. Stored even
+	// when maxEstimated stayed 0 (eg. every build errored) — that just
+	// falls through to the bootstrap proxy in topologyDebounceFor.
+	b.lastBroadcastMaxEstimated.Store(maxEstimated)
 }
 
 // heartbeat sends periodic heartbeats to keep connections alive

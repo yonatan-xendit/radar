@@ -168,7 +168,7 @@ func TestLargeClusterDetection(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			b := NewBuilder(tt.provider)
 			opts := DefaultBuildOptions()
-			gotLarge, _ := b.detectLargeClusterAndOptimize(&opts)
+			gotLarge, _, _ := b.detectLargeClusterAndOptimize(&opts)
 			if gotLarge != tt.wantLarge {
 				t.Errorf("detectLargeClusterAndOptimize() = %v, want %v (%s)", gotLarge, tt.wantLarge, tt.description)
 			}
@@ -187,7 +187,7 @@ func TestLargeClusterOptimizations(t *testing.T) {
 		t.Fatal("precondition: IncludePVCs should default to true")
 	}
 
-	isLarge, hiddenKinds := b.detectLargeClusterAndOptimize(&opts)
+	isLarge, hiddenKinds, _ := b.detectLargeClusterAndOptimize(&opts)
 	if !isLarge {
 		t.Fatal("expected large cluster detection")
 	}
@@ -216,7 +216,7 @@ func TestSmallClusterUnaffected(t *testing.T) {
 	b := NewBuilder(smallProvider())
 	opts := DefaultBuildOptions()
 
-	isLarge, hiddenKinds := b.detectLargeClusterAndOptimize(&opts)
+	isLarge, hiddenKinds, _ := b.detectLargeClusterAndOptimize(&opts)
 	if isLarge {
 		t.Error("small cluster should not be detected as large")
 	}
@@ -339,7 +339,7 @@ func TestNamespaceFilterReducesEstimate(t *testing.T) {
 
 	// All namespaces → large
 	allOpts := DefaultBuildOptions()
-	isLarge, _ := b.detectLargeClusterAndOptimize(&allOpts)
+	isLarge, _, _ := b.detectLargeClusterAndOptimize(&allOpts)
 	if !isLarge {
 		t.Error("all-namespace should be detected as large (2000 deployments)")
 	}
@@ -347,7 +347,7 @@ func TestNamespaceFilterReducesEstimate(t *testing.T) {
 	// Single namespace → small
 	filteredOpts := DefaultBuildOptions()
 	filteredOpts.Namespaces = []string{"ns-0"}
-	isLarge, _ = b.detectLargeClusterAndOptimize(&filteredOpts)
+	isLarge, _, _ = b.detectLargeClusterAndOptimize(&filteredOpts)
 	if isLarge {
 		t.Error("single namespace (100 deployments) should NOT be detected as large")
 	}

@@ -1,7 +1,17 @@
 import { useState, useEffect } from 'react'
-import { Server, ExternalLink, Scale, Minus, Plus, Loader2 } from 'lucide-react'
-import { Section, PropertyList, Property, ConditionsSection, PodTemplateSection, AlertBanner, ResourceLink } from '../../ui/drawer-components'
+import { Server, ExternalLink, Scale, Minus, Plus, Loader2, Shield } from 'lucide-react'
+import { clsx } from 'clsx'
+import { Section, PropertyList, Property, ConditionsSection, PodTemplateSection, AlertBanner, ResourceLink, ResourceRefBadge } from '../../ui/drawer-components'
 import { DialogPortal } from '../../ui/DialogPortal'
+import { Tooltip } from '../../ui/Tooltip'
+import type { RBACSubjectResponse, RBACPolicyRule, ResourceRef } from '../../../types'
+import { detectBlastRadius, rulePermissivenessScore } from '../../../utils/rbac-blast-radius'
+import { RBACErrorSection, isRBACUnavailable } from './RBACErrorSection'
+import {
+  rbacVerbBadgeClass,
+  rbacResourceBadgeClass,
+  rbacApiGroupBadgeClass,
+} from '../../../utils/rbac-badges'
 
 interface WorkloadRendererProps {
   kind: string
@@ -10,7 +20,16 @@ interface WorkloadRendererProps {
   onViewPods?: () => void
   onScale?: (replicas: number) => Promise<void>
   isScalePending?: boolean
+  scaleBlockedBy?: ResourceRef[]
   onRequestRefresh?: () => void
+  /**
+   * RBAC reverse-lookup for the workload's pod-template ServiceAccount.
+   * Undefined means the host didn't wire the fetch (Permissions section is
+   * omitted). Null means the fetch failed.
+   */
+  rbacData?: RBACSubjectResponse | null
+  rbacLoading?: boolean
+  rbacError?: Error | null
 }
 
 // Check if the workload is actively progressing (scaling, rolling update)
@@ -86,14 +105,23 @@ function getWorkloadProgress(status: any, spec: any, kind: string): string | nul
   return null
 }
 
-export function WorkloadRenderer({ kind, data, onNavigate, onViewPods, onScale, isScalePending, onRequestRefresh }: WorkloadRendererProps) {
+function formatScalerLabel(ref: ResourceRef): string {
+  const prefix = ref.namespace ? `${ref.namespace}/` : ''
+  return `${ref.kind} ${prefix}${ref.name}`
+}
+
+export function WorkloadRenderer({ kind, data, onNavigate, onViewPods, onScale, isScalePending, scaleBlockedBy, onRequestRefresh, rbacData, rbacLoading, rbacError }: WorkloadRendererProps) {
   const status = data.status || {}
   const spec = data.spec || {}
   const metadata = data.metadata || {}
 
   const isDaemonSet = kind === 'daemonsets'
   const isStatefulSet = kind === 'statefulsets'
-  const isScalable = (kind === 'deployments' || kind === 'statefulsets') && !!onScale
+  const isScalableKind = kind === 'deployments' || kind === 'statefulsets'
+  const isScaleBlocked = !!scaleBlockedBy?.length
+  const isScalable = isScalableKind && !!onScale && !isScaleBlocked
+  const scaleBlockedLabel = scaleBlockedBy?.map(formatScalerLabel).join(', ')
+  const scaleBlockedReason = `Manual scaling is disabled because replicas are controlled by ${scaleBlockedLabel}. Manage scaling there instead.`
 
   // Scale dialog state
   const [showScaleDialog, setShowScaleDialog] = useState(false)
@@ -122,8 +150,14 @@ export function WorkloadRenderer({ kind, data, onNavigate, onViewPods, onScale, 
     return () => clearInterval(interval)
   }, [isScaling, onRequestRefresh])
 
+  useEffect(() => {
+    if (isScaleBlocked) {
+      setShowScaleDialog(false)
+    }
+  }, [isScaleBlocked])
+
   const handleScale = async () => {
-    if (!onScale) return
+    if (!onScale || isScaleBlocked) return
     try {
       await onScale(targetReplicas)
       setScaledTo(targetReplicas)
@@ -185,6 +219,18 @@ export function WorkloadRenderer({ kind, data, onNavigate, onViewPods, onScale, 
           ) : (
             <>
               <Property label="Replicas" value={`${status.readyReplicas || 0}/${spec.replicas || 0}`} />
+              {scaleBlockedBy && scaleBlockedBy.length > 0 && (
+                <Property
+                  label="Controlled by"
+                  value={
+                    <div className="flex flex-wrap gap-1">
+                      {scaleBlockedBy.map((ref) => (
+                        <ResourceRefBadge key={`${ref.kind}/${ref.namespace}/${ref.name}`} resourceRef={ref} onClick={onNavigate} />
+                      ))}
+                    </div>
+                  }
+                />
+              )}
               <Property label="Updated" value={status.updatedReplicas} />
               <Property label="Available" value={status.availableReplicas} />
               <Property label="Unavailable" value={status.unavailableReplicas} />
@@ -201,7 +247,7 @@ export function WorkloadRenderer({ kind, data, onNavigate, onViewPods, onScale, 
               View Managed Pods
             </button>
           )}
-          {isScalable && (
+          {isScalable ? (
             <button
               onClick={openScaleDialog}
               className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-emerald-400 hover:text-emerald-300 bg-emerald-500/10 hover:bg-emerald-500/20 border border-emerald-500/30 rounded transition-colors"
@@ -209,7 +255,20 @@ export function WorkloadRenderer({ kind, data, onNavigate, onViewPods, onScale, 
               <Scale className="w-3 h-3" />
               Scale
             </button>
-          )}
+          ) : isScalableKind && !!onScale && isScaleBlocked ? (
+            <Tooltip content={scaleBlockedReason}>
+              <button
+                type="button"
+                disabled
+                title={scaleBlockedReason}
+                aria-label={scaleBlockedReason}
+                className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-theme-text-tertiary bg-theme-elevated border border-theme-border rounded cursor-not-allowed"
+              >
+                <Scale className="w-3 h-3" />
+                Scale
+              </button>
+            </Tooltip>
+          ) : null}
         </div>
       </Section>
 
@@ -304,6 +363,177 @@ export function WorkloadRenderer({ kind, data, onNavigate, onViewPods, onScale, 
       </Section>
 
       <ConditionsSection conditions={status.conditions} />
+
+      {/* Permissions — same shape as PodPermissionsSection but framed for a
+       *  workload (Pods this workload spawns inherit the SA). Placed below
+       *  the diagnostic-signal sections because it answers an incident/audit
+       *  question, not a daily-browsing one. Only renders when the host
+       *  wired the RBAC fetch. */}
+      {rbacData !== undefined && (
+        <WorkloadPermissionsSection
+          saName={spec.template?.spec?.serviceAccountName || 'default'}
+          namespace={metadata.namespace || ''}
+          rbacData={rbacData}
+          loading={!!rbacLoading}
+          error={rbacError ?? null}
+          onNavigate={onNavigate}
+        />
+      )}
     </>
+  )
+}
+
+// ============================================================================
+// WORKLOAD PERMISSIONS SECTION
+// ============================================================================
+// Mirror of PodPermissionsSection but framed at the workload level: "Pods
+// this workload spawns inherit these permissions". A compromise of any
+// replica gives the attacker the same SA. Detection criteria match Pod's —
+// verb wildcards, escalation verbs (escalate/bind/impersonate), cluster-
+// admin, cluster-wide create pods. Resource-only wildcards do NOT trigger
+// (would fire on every authenticated SA via inherited `view`).
+
+// Blast-radius detection and scoring is shared with Pod / ServiceAccount
+// renderers — see utils/rbac-blast-radius.ts.
+
+interface WorkloadPermissionsSectionProps {
+  saName: string
+  namespace: string
+  rbacData: RBACSubjectResponse | null
+  loading: boolean
+  error: Error | null
+  onNavigate?: (ref: { kind: string; namespace: string; name: string }) => void
+}
+
+function WorkloadPermissionsSection({
+  saName,
+  namespace,
+  rbacData,
+  loading,
+  error,
+  onNavigate,
+}: WorkloadPermissionsSectionProps) {
+  const title = `Permissions via ServiceAccount: ${saName}`
+  if (loading) {
+    return (
+      <Section title={title} icon={Shield}>
+        <div className="text-sm text-theme-text-secondary">Loading RBAC graph…</div>
+      </Section>
+    )
+  }
+  if (error) {
+    // Permissions is a bonus section here; when RBAC is simply not available
+    // (cluster-static) or forbidden, hide it rather than repeat a note on every
+    // workload. Genuine faults still surface.
+    if (isRBACUnavailable(error)) return null
+    return <RBACErrorSection title={title} error={error} />
+  }
+  if (!rbacData) return null
+
+  const blast = detectBlastRadius(rbacData)
+  const sorted = [...(rbacData.flat ?? [])].sort(
+    (a, b) => rulePermissivenessScore(b) - rulePermissivenessScore(a),
+  )
+  const preview = sorted.slice(0, 5)
+  const more = Math.max(0, sorted.length - preview.length)
+  const directCount = rbacData.direct?.length ?? 0
+  const inheritedCount = (rbacData.inheritedFromGroups ?? []).reduce((n, g) => n + g.bindings.length, 0)
+  const ruleCount = rbacData.flat?.length ?? 0
+
+  // Default collapsed unless the Pod's permissions are genuinely risky —
+  // workload-detail pages are most-often opened for "is this rolling out
+  // OK / why is it crashing", not "audit the SA". Auto-expanding only on
+  // blast-radius hits keeps the noisy case quiet without burying real
+  // alarms.
+  const hasBlastRadius = blast.length > 0
+  return (
+    <Section title={title} icon={Shield} defaultExpanded={hasBlastRadius}>
+      {blast.length > 0 && (
+        <AlertBanner variant="warning" title="Blast radius">
+          <div className="text-xs">
+            Every Pod this workload spawns inherits the ServiceAccount's
+            permissions. Compromising any replica gives an attacker:
+          </div>
+          <ul className="mt-1.5 text-xs space-y-1">
+            {blast.map((r, i) => (
+              <li key={i}>
+                <span className="text-theme-text-secondary">
+                  {r.binding.binding.kind} <span className="font-medium">{r.binding.binding.name}</span>
+                </span>{' '}
+                <span className="text-theme-text-tertiary">{r.reason}</span>
+              </li>
+            ))}
+          </ul>
+        </AlertBanner>
+      )}
+
+      <div className="text-xs text-theme-text-tertiary mb-3">
+        {directCount} direct binding{directCount === 1 ? '' : 's'} ·{' '}
+        {inheritedCount} inherited via group{inheritedCount === 1 ? '' : 's'} ·{' '}
+        {ruleCount} distinct rule{ruleCount === 1 ? '' : 's'}
+        {rbacData.truncated && <span className="text-orange-400"> (truncated)</span>}
+      </div>
+
+      {preview.length === 0 ? (
+        <div className="text-sm text-theme-text-secondary">
+          This ServiceAccount has no effective permissions in the cluster.
+        </div>
+      ) : (
+        <div className="space-y-1">
+          {preview.map((r, i) => (
+            <WorkloadRulePreviewLine key={i} rule={r} />
+          ))}
+          {more > 0 && (
+            <div className="text-xs text-theme-text-tertiary">
+              +{more} more rule{more === 1 ? '' : 's'} — open the ServiceAccount
+              for full provenance.
+            </div>
+          )}
+        </div>
+      )}
+
+      <div className="mt-3 text-xs">
+        <ResourceLink
+          name={saName}
+          kind="serviceaccounts"
+          namespace={namespace}
+          label="View full permissions →"
+          onNavigate={onNavigate}
+        />
+      </div>
+    </Section>
+  )
+}
+
+function WorkloadRulePreviewLine({ rule }: { rule: RBACPolicyRule }) {
+  const verbs = rule.verbs ?? []
+  const resources = rule.resources ?? []
+  const nonResourceURLs = rule.nonResourceURLs ?? []
+  const groups = rule.apiGroups ?? []
+  const isNonResource = resources.length === 0 && nonResourceURLs.length > 0
+  return (
+    <div className="flex items-center gap-1 flex-wrap text-xs">
+      {verbs.map((v) => (
+        <span key={v} className={clsx('badge', rbacVerbBadgeClass(v))}>{v}</span>
+      ))}
+      <span className="text-theme-text-secondary">on</span>
+      {isNonResource ? (
+        nonResourceURLs.map((u) => (
+          <span key={u} className="badge font-mono bg-theme-elevated text-theme-text-secondary">{u}</span>
+        ))
+      ) : (
+        resources.map((r) => (
+          <span key={r} className={clsx('badge', rbacResourceBadgeClass)}>{r === '*' ? '*' : r}</span>
+        ))
+      )}
+      {!isNonResource && groups.length > 0 && groups.some((g) => g !== '') && (
+        <>
+          <span className="text-theme-text-secondary">in</span>
+          {groups.map((g) => (
+            <span key={g} className={clsx('badge', rbacApiGroupBadgeClass)}>{g === '' ? 'core' : g}</span>
+          ))}
+        </>
+      )}
+    </div>
   )
 }

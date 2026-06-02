@@ -93,6 +93,7 @@ export const SEVERITY_BADGE = BADGE_SEVERITY_COLORS
 export const SEVERITY_TEXT = {
   success: 'text-emerald-700 dark:text-emerald-400',
   warning: 'text-amber-700 dark:text-amber-400',
+  alert: 'text-orange-700 dark:text-orange-400',
   error: 'text-red-700 dark:text-red-400',
   info: 'text-sky-700 dark:text-sky-400',
   neutral: 'text-theme-text-secondary',
@@ -102,6 +103,7 @@ export const SEVERITY_TEXT = {
 export const SEVERITY_DOT = {
   success: 'bg-emerald-500',
   warning: 'bg-amber-500',
+  alert: 'bg-orange-500',
   error: 'bg-red-500',
   info: 'bg-sky-500',
   neutral: 'bg-theme-hover',
@@ -111,6 +113,7 @@ export const SEVERITY_DOT = {
 export const SEVERITY_BORDER = {
   success: 'border-emerald-200 dark:border-emerald-800/40',
   warning: 'border-amber-200 dark:border-amber-800/40',
+  alert: 'border-orange-200 dark:border-orange-800/40',
   error: 'border-red-200 dark:border-red-800/40',
   info: 'border-sky-200 dark:border-sky-800/40',
   neutral: 'border-theme-border',
@@ -123,7 +126,7 @@ export const SEVERITY_BADGE_BORDERED = {
 } as const
 
 // Severity type
-export type Severity = 'success' | 'warning' | 'error' | 'info' | 'neutral'
+export type Severity = 'success' | 'warning' | 'alert' | 'error' | 'info' | 'neutral'
 
 // =============================================================================
 // RESOURCE STATUS COLORS - for K8s resource states
@@ -216,6 +219,8 @@ export function healthToSeverity(health: string): Severity {
     case 'warning':
     case 'pending':
       return 'warning'
+    case 'alert':
+      return 'alert'
     case 'unhealthy':
     case 'error':
     case 'failed':
@@ -279,6 +284,31 @@ export function getHealthBadgeColor(healthState: string): string {
 export function getHelmStatusColor(status: string): string {
   const statusLower = status.toLowerCase()
   return HELM_STATUS_COLORS[statusLower] || 'bg-theme-hover/50 text-theme-text-secondary'
+}
+
+/**
+ * Helm release statuses where the row UI should signpost the user
+ * toward the drawer (history / rollback / logs).
+ *
+ * Currently `failed` only. The `pending-*` statuses (install /
+ * upgrade / rollback) are excluded deliberately: they're Helm's
+ * normal in-flight states during every routine operation. Treating
+ * them as "actionable" would briefly attach an alarming chevron +
+ * tooltip to every install while it ran — indistinguishable from
+ * the genuinely-stuck case (controller crashed mid-flight). Until
+ * we have release age available client-side to disambiguate
+ * "in-flight" from "stuck > N min", we give up the stuck-detect
+ * signpost rather than wrongly alarm the common case.
+ *
+ * @see https://github.com/helm/helm/blob/dev-v3/pkg/release/status.go
+ */
+const ACTIONABLE_HELM_STATUSES: ReadonlySet<string> = new Set([
+  'failed',
+])
+
+export function isHelmReleaseActionable(status: string | null | undefined): boolean {
+  if (!status) return false
+  return ACTIONABLE_HELM_STATUSES.has(status.toLowerCase())
 }
 
 // =============================================================================

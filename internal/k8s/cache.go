@@ -2,6 +2,7 @@ package k8s
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -27,6 +28,12 @@ import (
 // DebugEvents enables verbose event debugging when true (set via --debug-events flag)
 var DebugEvents bool
 
+// ListPageSize, when > 0, makes high-cardinality informers (Pods, ReplicaSets)
+// paginate their initial LIST instead of pulling it in one response (set via
+// --list-page-size flag). Opt-in hardening for very large clusters where
+// WatchList streaming isn't available; 0 keeps the standard behavior.
+var ListPageSize int64
+
 // TimingLogs enables [startup-timing] log lines when true (set via --dev flag).
 // These are useful for profiling startup but too noisy for production.
 var TimingLogs bool
@@ -48,8 +55,7 @@ var initialSyncComplete bool
 // deferredResources lists informer keys that are NOT required for the initial
 // dashboard render. These sync in the background after the critical informers
 // complete, so the UI can render immediately with core resources.
-// Critical: pods, deployments, services, statefulsets, daemonsets, nodes,
-//           namespaces, ingresses, jobs, cronjobs
+// Critical: pods, deployments, services, statefulsets, daemonsets, nodes, namespaces, ingresses, jobs, cronjobs.
 var deferredResources = map[string]bool{
 	"secrets":                  true,
 	"events":                   true,
@@ -63,6 +69,7 @@ var deferredResources = map[string]bool{
 	"horizontalpodautoscalers": true, // problems detection, not critical for first render
 	"serviceaccounts":          true, // audit inheritance lookups, not first-render
 	"limitranges":              true, // audit inheritance lookups, not first-render
+	"resourcequotas":           true, // scheduling/admission diagnostics, not first-render
 }
 
 // minimalFirstPaintSet is the subset of critical informers the home
@@ -122,51 +129,33 @@ func InitResourceCache(ctx context.Context) error {
 			return
 		}
 
-		// Check RBAC permissions for all resource types before creating informers.
+		// Probe per-resource list access before creating informers. The
+		// returned scope map is authoritative for both enablement and
+		// per-kind namespace scoping (some kinds may be cluster-wide while
+		// others are namespace-scoped to the same fallback namespace).
 		rbacStart := time.Now()
 		rbacCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 		permResult := CheckResourcePermissions(rbacCtx)
 		cancel()
-		logTiming("    RBAC permission checks: %v", time.Since(rbacStart))
+		logTiming("    Resource access probes: %v", time.Since(rbacStart))
 
 		if ctx.Err() != nil {
 			initErr = ctx.Err()
 			return
 		}
 
-		perms := permResult.Perms
-
-		enabled := map[string]bool{
-			"pods":                     perms.Pods,
-			"services":                 perms.Services,
-			"deployments":              perms.Deployments,
-			"daemonsets":               perms.DaemonSets,
-			"statefulsets":             perms.StatefulSets,
-			"replicasets":              perms.ReplicaSets,
-			"ingresses":                perms.Ingresses,
-			"configmaps":               perms.ConfigMaps,
-			"secrets":                  perms.Secrets,
-			"events":                   perms.Events,
-			"persistentvolumeclaims":   perms.PersistentVolumeClaims,
-			"nodes":                    perms.Nodes,
-			"namespaces":               perms.Namespaces,
-			"jobs":                     perms.Jobs,
-			"cronjobs":                 perms.CronJobs,
-			"horizontalpodautoscalers": perms.HorizontalPodAutoscalers,
-			"persistentvolumes":        perms.PersistentVolumes,
-			"storageclasses":           perms.StorageClasses,
-			"poddisruptionbudgets":     perms.PodDisruptionBudgets,
-			"networkpolicies":          perms.NetworkPolicies,
-			"serviceaccounts":          perms.ServiceAccounts,
-			"limitranges":              perms.LimitRanges,
+		// scopes drives which informers are created and at what scope.
+		// k8score routes each kind through the matching factory (cluster-wide
+		// or namespace-scoped) based on these per-kind decisions.
+		scopes := permResult.Scopes
+		if scopes == nil {
+			scopes = map[string]k8score.ResourceScope{}
 		}
 
 		cfg := k8score.CacheConfig{
 			Client:              k8sClient,
-			ResourceTypes:       enabled,
+			ResourceScopes:      scopes,
 			DeferredTypes:       deferredResources,
-			NamespaceScoped:     permResult.NamespaceScoped,
-			Namespace:           permResult.Namespace,
 			DebugEvents:         DebugEvents,
 			TimingLogger:        logTiming,
 			PatienceWindow:      firstPaintPatience,
@@ -174,6 +163,7 @@ func InitResourceCache(ctx context.Context) error {
 			SyncTimeout:         firstPaintBackstop,
 			SyncProgress:        emitSyncProgress,
 			DeferredSyncTimeout: 3 * time.Minute,
+			ListPageSize:        ListPageSize,
 
 			OnReceived: func(kind string) {
 				timeline.IncrementReceived(kind)
@@ -222,7 +212,7 @@ func InitResourceCache(ctx context.Context) error {
 
 		resourceCache = &ResourceCache{
 			ResourceCache:  core,
-			secretsEnabled: enabled["secrets"],
+			secretsEnabled: scopes["secrets"].Enabled,
 		}
 	})
 	return initErr
@@ -333,6 +323,11 @@ func isNoisyResource(kind, name, op string) bool {
 	switch kind {
 	case "Lease", "Endpoints", "EndpointSlice", "Event":
 		return true
+	case "VerticalPodAutoscalerCheckpoint":
+		// VPA writes per-container resource recommendations here on every
+		// reconcile (~1m). The whole point of the resource is to be a live
+		// ticker — per-update is never user-meaningful.
+		return true
 	}
 
 	if kind == "ConfigMap" {
@@ -356,6 +351,20 @@ func isNoisyResource(kind, name, op string) bool {
 	}
 
 	return false
+}
+
+// getGeneration returns the metadata.generation of an informer object, or 0
+// if the object is nil or doesn't expose metav1.Object. Both typed K8s
+// resources and *unstructured.Unstructured satisfy metav1.Object.
+func getGeneration(obj any) int64 {
+	if obj == nil {
+		return 0
+	}
+	m, ok := obj.(metav1.Object)
+	if !ok {
+		return 0
+	}
+	return m.GetGeneration()
 }
 
 // recordToTimelineStore records an event to the timeline store
@@ -385,6 +394,7 @@ func recordToTimelineStore(kind, namespace, name, uid, op string, oldObj, newObj
 	owner := timeline.ExtractOwner(obj)
 	labels := timeline.ExtractLabels(obj)
 	healthState := timeline.DetermineHealthState(kind, obj)
+	apiVersion := extractAPIVersion(obj)
 
 	var createdAt *time.Time
 	if obj != nil {
@@ -410,11 +420,35 @@ func recordToTimelineStore(kind, namespace, name, uid, op string, oldObj, newObj
 					NewValue: f.NewValue,
 				}
 			}
+		} else if KindHasDiffer(kind) || isUnstructuredUpdate(oldObj, newObj) {
+			// Diff handling found nothing observable — usually a heartbeat,
+			// managedFields-only update, or reconcile counter.
+			// Before dropping, check metadata.generation: it bumps only on
+			// spec changes (status updates don't touch it), so a generation
+			// flip with a nil diff means our diff function missed a real spec
+			// field. Record those with a fallback summary instead of silently
+			// losing them — diff coverage gaps shouldn't become silent drops.
+			if oldGen, newGen := getGeneration(oldObj), getGeneration(newObj); oldGen != newGen && oldGen > 0 && newGen > 0 {
+				diff = &timeline.DiffInfo{
+					Fields: []timeline.FieldChange{{
+						Path:     "metadata.generation",
+						OldValue: oldGen,
+						NewValue: newGen,
+					}},
+					Summary: fmt.Sprintf("spec changed (gen %d→%d, fields not specifically tracked)", oldGen, newGen),
+				}
+			} else {
+				timeline.RecordDrop(kind, namespace, name, timeline.DropReasonNoDiff, op)
+				if DebugEvents {
+					log.Printf("[DEBUG] No-diff update, skipping: %s/%s/%s", kind, namespace, name)
+				}
+				return
+			}
 		}
 	}
 
 	event := timeline.NewInformerEvent(
-		kind, namespace, name, uid,
+		kind, apiVersion, namespace, name, uid,
 		timeline.OperationToEventType(op),
 		healthState,
 		diff,
@@ -425,7 +459,7 @@ func recordToTimelineStore(kind, namespace, name, uid, op string, oldObj, newObj
 
 	var events []timeline.TimelineEvent
 	if op == "add" && newObj != nil {
-		historicalEvents := extractTimelineHistoricalEvents(kind, namespace, name, newObj, owner, labels)
+		historicalEvents := extractTimelineHistoricalEvents(kind, apiVersion, namespace, name, newObj, owner, labels)
 		events = append(events, historicalEvents...)
 	}
 
@@ -457,8 +491,11 @@ func recordToTimelineStore(kind, namespace, name, uid, op string, oldObj, newObj
 				ctx := context.Background()
 				if err := timeline.RecordEventsWithBroadcast(ctx, events); err != nil {
 					log.Printf("Warning: failed to record historical events: %v", err)
+					timeline.RecordDrop(kind, namespace, name, timeline.DropReasonStoreFailed, op)
+					return
 				}
 			}
+			store.MarkResourceSeen(kind, namespace, name)
 			return
 		}
 	}
@@ -479,19 +516,36 @@ func recordToTimelineStore(kind, namespace, name, uid, op string, oldObj, newObj
 	}
 }
 
+func isUnstructuredUpdate(oldObj, newObj any) bool {
+	_, oldOK := oldObj.(*unstructured.Unstructured)
+	_, newOK := newObj.(*unstructured.Unstructured)
+	return oldOK && newOK
+}
+
+// extractAPIVersion returns the resource's apiVersion (e.g. "cluster.x-k8s.io/v1beta1")
+// for unstructured/CRD objects. Typed informer objects strip kind/apiVersion, so they
+// fall through to "" — the navigation layer treats an empty group as "core/typed kind",
+// which is correct since core kinds don't collide.
+func extractAPIVersion(obj any) string {
+	if u, ok := obj.(*unstructured.Unstructured); ok {
+		return u.GetAPIVersion()
+	}
+	return ""
+}
+
 // extractTimelineHistoricalEvents extracts historical events from resource metadata/status
-func extractTimelineHistoricalEvents(kind, namespace, name string, obj any, owner *timeline.OwnerInfo, labels map[string]string) []timeline.TimelineEvent {
+func extractTimelineHistoricalEvents(kind, apiVersion, namespace, name string, obj any, owner *timeline.OwnerInfo, labels map[string]string) []timeline.TimelineEvent {
 	var events []timeline.TimelineEvent
 
 	switch kind {
 	case "Pod":
 		if pod, ok := obj.(*corev1.Pod); ok {
 			if !pod.CreationTimestamp.IsZero() {
-				events = append(events, timeline.NewHistoricalEvent(kind, namespace, name,
+				events = append(events, timeline.NewHistoricalEvent(kind, apiVersion, namespace, name,
 					pod.CreationTimestamp.Time, "created", "", timeline.HealthUnknown, owner, labels))
 			}
 			if pod.Status.StartTime != nil && !pod.Status.StartTime.IsZero() {
-				events = append(events, timeline.NewHistoricalEvent(kind, namespace, name,
+				events = append(events, timeline.NewHistoricalEvent(kind, apiVersion, namespace, name,
 					pod.Status.StartTime.Time, "started", "", timeline.HealthDegraded, owner, labels))
 			}
 			for _, cond := range pod.Status.Conditions {
@@ -504,7 +558,7 @@ func extractTimelineHistoricalEvents(kind, namespace, name string, obj any, owne
 				} else if cond.Status == corev1.ConditionFalse {
 					health = timeline.HealthDegraded
 				}
-				events = append(events, timeline.NewHistoricalEvent(kind, namespace, name,
+				events = append(events, timeline.NewHistoricalEvent(kind, apiVersion, namespace, name,
 					cond.LastTransitionTime.Time, string(cond.Type), cond.Message, health, owner, labels))
 			}
 		}
@@ -512,7 +566,7 @@ func extractTimelineHistoricalEvents(kind, namespace, name string, obj any, owne
 	case "Deployment":
 		if deploy, ok := obj.(*appsv1.Deployment); ok {
 			if !deploy.CreationTimestamp.IsZero() {
-				events = append(events, timeline.NewHistoricalEvent(kind, namespace, name,
+				events = append(events, timeline.NewHistoricalEvent(kind, apiVersion, namespace, name,
 					deploy.CreationTimestamp.Time, "created", "", timeline.HealthUnknown, owner, labels))
 			}
 			for _, cond := range deploy.Status.Conditions {
@@ -525,7 +579,7 @@ func extractTimelineHistoricalEvents(kind, namespace, name string, obj any, owne
 				} else if cond.Status == corev1.ConditionFalse {
 					health = timeline.HealthDegraded
 				}
-				events = append(events, timeline.NewHistoricalEvent(kind, namespace, name,
+				events = append(events, timeline.NewHistoricalEvent(kind, apiVersion, namespace, name,
 					cond.LastTransitionTime.Time, string(cond.Type), cond.Message, health, owner, labels))
 			}
 		}
@@ -537,7 +591,7 @@ func extractTimelineHistoricalEvents(kind, namespace, name string, obj any, owne
 				if rs.Status.ReadyReplicas > 0 && rs.Status.ReadyReplicas == rs.Status.Replicas {
 					health = timeline.HealthHealthy
 				}
-				events = append(events, timeline.NewHistoricalEvent(kind, namespace, name,
+				events = append(events, timeline.NewHistoricalEvent(kind, apiVersion, namespace, name,
 					rs.CreationTimestamp.Time, "created", "", health, owner, labels))
 			}
 		}
@@ -545,7 +599,7 @@ func extractTimelineHistoricalEvents(kind, namespace, name string, obj any, owne
 	case "StatefulSet":
 		if sts, ok := obj.(*appsv1.StatefulSet); ok {
 			if !sts.CreationTimestamp.IsZero() {
-				events = append(events, timeline.NewHistoricalEvent(kind, namespace, name,
+				events = append(events, timeline.NewHistoricalEvent(kind, apiVersion, namespace, name,
 					sts.CreationTimestamp.Time, "created", "", timeline.HealthUnknown, owner, labels))
 			}
 		}
@@ -553,7 +607,7 @@ func extractTimelineHistoricalEvents(kind, namespace, name string, obj any, owne
 	case "DaemonSet":
 		if ds, ok := obj.(*appsv1.DaemonSet); ok {
 			if !ds.CreationTimestamp.IsZero() {
-				events = append(events, timeline.NewHistoricalEvent(kind, namespace, name,
+				events = append(events, timeline.NewHistoricalEvent(kind, apiVersion, namespace, name,
 					ds.CreationTimestamp.Time, "created", "", timeline.HealthUnknown, owner, labels))
 			}
 		}
@@ -561,7 +615,7 @@ func extractTimelineHistoricalEvents(kind, namespace, name string, obj any, owne
 	case "Service":
 		if svc, ok := obj.(*corev1.Service); ok {
 			if !svc.CreationTimestamp.IsZero() {
-				events = append(events, timeline.NewHistoricalEvent(kind, namespace, name,
+				events = append(events, timeline.NewHistoricalEvent(kind, apiVersion, namespace, name,
 					svc.CreationTimestamp.Time, "created", "", timeline.HealthHealthy, owner, labels))
 			}
 		}
@@ -569,7 +623,7 @@ func extractTimelineHistoricalEvents(kind, namespace, name string, obj any, owne
 	case "Ingress":
 		if ing, ok := obj.(*networkingv1.Ingress); ok {
 			if !ing.CreationTimestamp.IsZero() {
-				events = append(events, timeline.NewHistoricalEvent(kind, namespace, name,
+				events = append(events, timeline.NewHistoricalEvent(kind, apiVersion, namespace, name,
 					ing.CreationTimestamp.Time, "created", "", timeline.HealthHealthy, owner, labels))
 			}
 		}
@@ -577,7 +631,7 @@ func extractTimelineHistoricalEvents(kind, namespace, name string, obj any, owne
 	case "CronJob":
 		if cj, ok := obj.(*batchv1.CronJob); ok {
 			if !cj.CreationTimestamp.IsZero() {
-				events = append(events, timeline.NewHistoricalEvent(kind, namespace, name,
+				events = append(events, timeline.NewHistoricalEvent(kind, apiVersion, namespace, name,
 					cj.CreationTimestamp.Time, "created", "", timeline.HealthHealthy, owner, labels))
 			}
 		}
@@ -585,7 +639,7 @@ func extractTimelineHistoricalEvents(kind, namespace, name string, obj any, owne
 	case "HorizontalPodAutoscaler":
 		if hpa, ok := obj.(*autoscalingv2.HorizontalPodAutoscaler); ok {
 			if !hpa.CreationTimestamp.IsZero() {
-				events = append(events, timeline.NewHistoricalEvent(kind, namespace, name,
+				events = append(events, timeline.NewHistoricalEvent(kind, apiVersion, namespace, name,
 					hpa.CreationTimestamp.Time, "created", "", timeline.HealthHealthy, owner, labels))
 			}
 		}
@@ -593,11 +647,11 @@ func extractTimelineHistoricalEvents(kind, namespace, name string, obj any, owne
 	case "Job":
 		if job, ok := obj.(*batchv1.Job); ok {
 			if !job.CreationTimestamp.IsZero() {
-				events = append(events, timeline.NewHistoricalEvent(kind, namespace, name,
+				events = append(events, timeline.NewHistoricalEvent(kind, apiVersion, namespace, name,
 					job.CreationTimestamp.Time, "created", "", timeline.HealthUnknown, owner, labels))
 			}
 			if job.Status.StartTime != nil && !job.Status.StartTime.IsZero() {
-				events = append(events, timeline.NewHistoricalEvent(kind, namespace, name,
+				events = append(events, timeline.NewHistoricalEvent(kind, apiVersion, namespace, name,
 					job.Status.StartTime.Time, "started", "", timeline.HealthDegraded, owner, labels))
 			}
 			if job.Status.CompletionTime != nil && !job.Status.CompletionTime.IsZero() {
@@ -605,7 +659,7 @@ func extractTimelineHistoricalEvents(kind, namespace, name string, obj any, owne
 				if job.Status.Failed > 0 {
 					health = timeline.HealthUnhealthy
 				}
-				events = append(events, timeline.NewHistoricalEvent(kind, namespace, name,
+				events = append(events, timeline.NewHistoricalEvent(kind, apiVersion, namespace, name,
 					job.Status.CompletionTime.Time, "completed", "", health, owner, labels))
 			}
 		}
@@ -614,7 +668,7 @@ func extractTimelineHistoricalEvents(kind, namespace, name string, obj any, owne
 		if u, ok := obj.(*unstructured.Unstructured); ok {
 			ct := u.GetCreationTimestamp()
 			if !ct.IsZero() {
-				events = append(events, timeline.NewHistoricalEvent(kind, namespace, name,
+				events = append(events, timeline.NewHistoricalEvent(kind, apiVersion, namespace, name,
 					ct.Time, "created", "", timeline.HealthUnknown, owner, labels))
 			}
 		}
@@ -645,6 +699,10 @@ var knownKinds = map[string]bool{
 	"storageclass": true, "storageclasses": true, "sc": true,
 	"poddisruptionbudget": true, "poddisruptionbudgets": true, "pdb": true, "pdbs": true,
 	"networkpolicy": true, "networkpolicies": true, "netpol": true,
+	"role": true, "roles": true,
+	"clusterrole": true, "clusterroles": true,
+	"rolebinding": true, "rolebindings": true,
+	"clusterrolebinding": true, "clusterrolebindings": true,
 }
 
 // IsKnownKind returns true if the kind is handled by the typed cache
@@ -674,10 +732,14 @@ func (c *ResourceCache) ListDynamicWithGroup(ctx context.Context, kind string, n
 	}
 
 	if !ok {
+		gvr, ok = builtinGVRFallback(kind, group)
+	}
+
+	if !ok {
 		if group != "" {
-			return nil, fmt.Errorf("unknown resource kind: %s (group: %s)", kind, group)
+			return nil, fmt.Errorf("%w: %s (group: %s)", ErrUnknownDynamicKind, kind, group)
 		}
-		return nil, fmt.Errorf("unknown resource kind: %s", kind)
+		return nil, fmt.Errorf("%w: %s", ErrUnknownDynamicKind, kind)
 	}
 
 	dynamicCache := GetDynamicResourceCache()
@@ -685,8 +747,29 @@ func (c *ResourceCache) ListDynamicWithGroup(ctx context.Context, kind string, n
 		return nil, fmt.Errorf("dynamic resource cache not initialized")
 	}
 
+	if gvr.Group == "discovery.k8s.io" && gvr.Resource == "endpointslices" {
+		return dynamicCache.ListDirect(ctx, gvr, namespace)
+	}
+
 	return dynamicCache.List(gvr, namespace)
 }
+
+// builtinGVRFallback resolves a built-in kind's GVR from the static table when
+// API discovery couldn't (partial discovery under restricted RBAC, or a
+// transient refresh miss). It only resolves built-ins addressed by their own
+// group, so a CRD whose plural shadows a built-in still falls through as
+// unknown. Live/dynamic fetch paths (notably the GitOps drift last-applied GET,
+// which can't use the typed cache) rely on this so they don't silently fail
+// when discovery is incomplete.
+func builtinGVRFallback(kind, group string) (schema.GroupVersionResource, bool) {
+	return BuiltinGVR(kind, group)
+}
+
+// ErrUnknownDynamicKind is returned by ListDynamic / GetDynamicWithGroup when
+// the requested kind has no registered GVR in API discovery. Wrapped with
+// fmt.Errorf("%w: ..."), so callers should match with errors.Is. The HTTP
+// layer translates this to 400 Bad Request.
+var ErrUnknownDynamicKind = errors.New("unknown resource kind")
 
 // GetDynamic returns a single resource of any type using the dynamic cache
 func (c *ResourceCache) GetDynamic(ctx context.Context, kind string, namespace string, name string) (*unstructured.Unstructured, error) {
@@ -695,6 +778,17 @@ func (c *ResourceCache) GetDynamic(ctx context.Context, kind string, namespace s
 
 // GetDynamicWithGroup returns a single resource, using the group to disambiguate
 func (c *ResourceCache) GetDynamicWithGroup(ctx context.Context, kind string, namespace string, name string, group string) (*unstructured.Unstructured, error) {
+	return c.getDynamicWithGroup(ctx, kind, namespace, name, group, false)
+}
+
+// GetDynamicWithGroupPreserveLastApplied returns a single resource while
+// preserving kubectl last-applied for internal drift computation. Do not use
+// for API/UI/MCP responses.
+func (c *ResourceCache) GetDynamicWithGroupPreserveLastApplied(ctx context.Context, kind string, namespace string, name string, group string) (*unstructured.Unstructured, error) {
+	return c.getDynamicWithGroup(ctx, kind, namespace, name, group, true)
+}
+
+func (c *ResourceCache) getDynamicWithGroup(ctx context.Context, kind string, namespace string, name string, group string, preserveLastApplied bool) (*unstructured.Unstructured, error) {
 	discovery := GetResourceDiscovery()
 	if discovery == nil {
 		return nil, fmt.Errorf("resource discovery not initialized")
@@ -710,10 +804,14 @@ func (c *ResourceCache) GetDynamicWithGroup(ctx context.Context, kind string, na
 	}
 
 	if !ok {
+		gvr, ok = builtinGVRFallback(kind, group)
+	}
+
+	if !ok {
 		if group != "" {
-			return nil, fmt.Errorf("unknown resource kind: %s (group: %s)", kind, group)
+			return nil, fmt.Errorf("%w: %s (group: %s)", ErrUnknownDynamicKind, kind, group)
 		}
-		return nil, fmt.Errorf("unknown resource kind: %s", kind)
+		return nil, fmt.Errorf("%w: %s", ErrUnknownDynamicKind, kind)
 	}
 
 	dynamicCache := GetDynamicResourceCache()
@@ -725,10 +823,21 @@ func (c *ResourceCache) GetDynamicWithGroup(ctx context.Context, kind string, na
 	// the dynamic cache strips to save memory. Bypass the cache on single-CRD
 	// fetches so the YAML tab and MCP get_resource see the full object; list
 	// views (which don't render schemas) still go through the cache.
+	//
+	// preserveLastApplied also goes via direct GET. The cached path would
+	// otherwise force-start a dynamic informer for the resource's GVR — fine
+	// for CRDs but a memory regression for core kinds (apps/Deployment,
+	// /v1/Service, etc.) that Argo's status.resources commonly references,
+	// since the informer would retain last-applied across every object
+	// cluster-wide just to power a per-page-load drift diff.
 	var u *unstructured.Unstructured
 	var err error
-	if gvr.Group == "apiextensions.k8s.io" && gvr.Resource == "customresourcedefinitions" {
+	if gvr.Group == "discovery.k8s.io" && gvr.Resource == "endpointslices" {
 		u, err = dynamicCache.GetDirect(ctx, gvr, namespace, name)
+	} else if gvr.Group == "apiextensions.k8s.io" && gvr.Resource == "customresourcedefinitions" {
+		u, err = dynamicCache.GetDirect(ctx, gvr, namespace, name)
+	} else if preserveLastApplied {
+		u, err = dynamicCache.GetDirectPreserveLastApplied(ctx, gvr, namespace, name)
 	} else {
 		u, err = dynamicCache.Get(gvr, namespace, name)
 	}
@@ -930,6 +1039,42 @@ func (c *ResourceCache) GetResourceStatus(kind, namespace, name string) *Resourc
 		return &ResourceStatus{
 			Status: "Active",
 		}
+
+	case "role", "roles":
+		if c.Roles() == nil {
+			return nil
+		}
+		if _, err := c.Roles().Roles(namespace).Get(name); err != nil {
+			return nil
+		}
+		return &ResourceStatus{Status: "Active"}
+
+	case "clusterrole", "clusterroles":
+		if c.ClusterRoles() == nil {
+			return nil
+		}
+		if _, err := c.ClusterRoles().Get(name); err != nil {
+			return nil
+		}
+		return &ResourceStatus{Status: "Active"}
+
+	case "rolebinding", "rolebindings":
+		if c.RoleBindings() == nil {
+			return nil
+		}
+		if _, err := c.RoleBindings().RoleBindings(namespace).Get(name); err != nil {
+			return nil
+		}
+		return &ResourceStatus{Status: "Active"}
+
+	case "clusterrolebinding", "clusterrolebindings":
+		if c.ClusterRoleBindings() == nil {
+			return nil
+		}
+		if _, err := c.ClusterRoleBindings().Get(name); err != nil {
+			return nil
+		}
+		return &ResourceStatus{Status: "Active"}
 
 	case "configmap", "configmaps":
 		if c.ConfigMaps() == nil {

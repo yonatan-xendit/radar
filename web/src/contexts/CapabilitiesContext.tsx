@@ -1,6 +1,6 @@
 import { createContext, useContext, useMemo, ReactNode } from 'react'
 import { useCapabilities, useNamespaceCapabilities } from '../api/client'
-import type { Capabilities, ResourcePermissions } from '../types'
+import { OPTIONAL_RESOURCE_KINDS, type Capabilities, type ResourcePermissions } from '../types'
 
 // Default capabilities for local development (when running locally, all features work)
 const defaultCapabilities: Capabilities = {
@@ -100,12 +100,17 @@ export function useResourcePermissions(): ResourcePermissions | undefined {
   return useContext(CapabilitiesContext).resources
 }
 
+// See OPTIONAL_RESOURCE_KINDS for why these are filtered.
+function isOptionalKind(kind: string): boolean {
+  return (OPTIONAL_RESOURCE_KINDS as ReadonlyArray<string>).includes(kind)
+}
+
 export function useRestrictedResources(): string[] {
   const resources = useContext(CapabilitiesContext).resources
   return useMemo(() => {
     if (!resources) return []
     return Object.entries(resources)
-      .filter(([, allowed]) => !allowed)
+      .filter(([kind, allowed]) => !allowed && !isOptionalKind(kind))
       .map(([kind]) => kind)
   }, [resources])
 }
@@ -113,7 +118,7 @@ export function useRestrictedResources(): string[] {
 export function useHasLimitedAccess(): boolean {
   const resources = useContext(CapabilitiesContext).resources
   if (!resources) return false
-  return Object.values(resources).some(allowed => !allowed)
+  return Object.entries(resources).some(([kind, allowed]) => !allowed && !isOptionalKind(kind))
 }
 
 // Namespace-scoped capability hooks: lazily re-check exec/logs/portForward

@@ -105,10 +105,12 @@ import {
   ClusterNetworkPolicyRenderer,
   PodDisruptionBudgetRenderer,
   ServiceAccountRenderer,
+  NamespaceRenderer,
   RoleRenderer,
   RoleBindingRenderer,
   WebhookConfigRenderer,
   EventRenderer,
+  EndpointSliceRenderer,
   GenericRenderer,
   GitRepositoryRenderer,
   OCIRepositoryRenderer,
@@ -199,10 +201,27 @@ import {
   AzureManagedControlPlaneRenderer,
   AzureManagedMachinePoolRenderer,
   AzureMachineRenderer,
+  ManagedResourceRenderer,
+  CompositeRenderer,
+  CrossplanePackageRenderer,
+  CrossplaneProviderConfigRenderer,
+  CompositionRenderer,
+  CompositionRevisionRenderer,
+  XRDRenderer,
 } from '../resources/renderers'
+import type { ComposedRefStatus } from '../resources/renderers/CompositeRenderer'
+import {
+  getCrossplaneStatus,
+  getProviderStatus,
+  getProviderConfigStatus,
+  isManagedResource,
+  isComposite,
+  isClaim,
+} from '../resources/resource-utils-crossplane'
 import type { SelectedResource, Relationships, ResourceRef, SecretCertificateInfo, ResolvedEnvFrom, TimelineEvent } from '../../types'
 import type { CopyHandler } from '../ui/drawer-components'
 import { AlertBanner } from '../ui/drawer-components'
+import { replicaScalers } from '../../utils/replica-scalers'
 
 /**
  * Override map letting each platform consumer swap in its own renderer components.
@@ -224,9 +243,57 @@ export interface RendererOverrides {
   }>
   ServiceRenderer?: React.ComponentType<{
     data: any; onCopy: CopyHandler; copied: string | null
+    onNavigate?: (ref: ResourceRef) => void
   }>
   WorkloadRenderer?: React.ComponentType<{
     kind: string; data: any
+    onNavigate?: (ref: ResourceRef) => void
+    relationships?: Relationships
+    scaleBlockedBy?: ResourceRef[]
+  }>
+  // Optional override for Crossplane Composite / Claim — host wraps the
+  // package renderer to fan out per-composed-ref status fetches via React Query.
+  CompositeRenderer?: React.ComponentType<{
+    data: any
+    onNavigate?: (ref: ResourceRef) => void
+    composedRefStatuses?: Map<string, ComposedRefStatus>
+  }>
+  // ServiceAccount reverse-lookup: the host fetches /api/rbac/subject/... and
+  // feeds the result into the base renderer via this wrapper.
+  ServiceAccountRenderer?: React.ComponentType<{
+    data: any
+    onNavigate?: (ref: ResourceRef) => void
+  }>
+  // Role / ClusterRole reverse-lookup: host fetches /api/rbac/role/... so the
+  // detail page can show "who is bound to this role".
+  RoleRenderer?: React.ComponentType<{
+    data: any
+    onNavigate?: (ref: ResourceRef) => void
+  }>
+  // RoleBinding inline rules preview: host fetches the referenced Role/
+  // ClusterRole's rules so the binding view can show what's granted without
+  // a navigation step.
+  RoleBindingRenderer?: React.ComponentType<{
+    data: any
+    onNavigate?: (ref: ResourceRef) => void
+  }>
+  // Namespace RBAC summary: host fetches /api/rbac/namespace/{ns} so the
+  // namespace page can show bindings configured here without falling
+  // through to GenericRenderer.
+  NamespaceRenderer?: React.ComponentType<{
+    data: any
+    onNavigate?: (ref: ResourceRef) => void
+  }>
+  // HPA: host wraps the base renderer to add Prometheus-backed replicas /
+  // metric charts below the static spec data.
+  HPARenderer?: React.ComponentType<{
+    data: any
+    onNavigate?: (ref: ResourceRef) => void
+  }>
+  // PVC: host wraps the base renderer to add a kubelet-derived usage gauge
+  // when Prometheus is scraping kubelet endpoints.
+  PVCRenderer?: React.ComponentType<{
+    data: any
     onNavigate?: (ref: ResourceRef) => void
   }>
 }
@@ -234,7 +301,7 @@ export interface RendererOverrides {
 // Known resource types with specific renderers (module-level to avoid re-allocation)
 const KNOWN_KINDS = new Set([
   'pods', 'deployments', 'statefulsets', 'daemonsets', 'replicasets',
-  'services', 'ingresses', 'configmaps', 'secrets', 'jobs', 'cronjobs',
+  'services', 'endpointslices', 'ingresses', 'configmaps', 'secrets', 'jobs', 'cronjobs',
   'hpas', 'horizontalpodautoscalers', 'nodes', 'persistentvolumeclaims',
   'rollouts', 'certificates', 'workflows', 'persistentvolumes',
   'storageclasses', 'certificaterequests', 'clusterissuers', 'issuers',
@@ -243,7 +310,7 @@ const KNOWN_KINDS = new Set([
   'networkpolicies', 'networkpolicy',
   'ciliumnetworkpolicies', 'ciliumnetworkpolicy', 'ciliumclusterwidenetworkpolicies', 'ciliumclusterwidenetworkpolicy',
   'clusternetworkpolicies', 'clusternetworkpolicy',
-  'poddisruptionbudgets', 'serviceaccounts',
+  'poddisruptionbudgets', 'serviceaccounts', 'namespaces',
   'roles', 'clusterroles', 'rolebindings', 'clusterrolebindings',
   'events', 'gitrepositories', 'ocirepositories', 'helmrepositories',
   'kustomizations', 'helmreleases', 'alerts', 'applications',
@@ -282,6 +349,12 @@ const KNOWN_KINDS = new Set([
   // Azure CAPI Infrastructure Provider
   'azuremanagedcontrolplanes', 'azuremanagedmachinepools', 'azuremachines',
   'azuremachinetemplates', 'azuremanagedclusters',
+  // Crossplane core (Managed Resources, Composites, and Claims are detected
+  // dynamically by spec shape — their plurals are unbounded so they're handled
+  // via fall-through, not enumerated in KNOWN_KINDS).
+  'providers', 'providerconfigs',
+  'compositeresourcedefinitions', 'compositions', 'compositionrevisions',
+  'functions', 'configurations',
 ])
 
 // ============================================================================
@@ -355,12 +428,48 @@ export function ResourceRendererDispatch({
 }: ResourceRendererDispatchProps) {
   const kind = resource.kind.toLowerCase()
 
-  const isKnownKind = KNOWN_KINDS.has(kind)
+  // Crossplane Managed Resources / Composites / Claims are detected by spec
+  // shape because their plurals are unbounded (one CRD kind per provider
+  // service). These flags suppress the GenericRenderer fall-through and route
+  // to the right Crossplane renderer below.
+  const isCrossplaneMR = isManagedResource(data)
+  const isCrossplaneClaim = !isCrossplaneMR && isClaim(data)
+  const isCrossplaneXR = !isCrossplaneMR && !isCrossplaneClaim && isComposite(data)
+
+  // Crossplane plurals that collide with foreign CRDs — `configurations`
+  // overlaps Knative serving.knative.dev/Configuration, `functions` could
+  // collide with OpenFaaS, `compositions` is in this list because its
+  // render line is apiVersion-gated. We add these to KNOWN_KINDS so the
+  // Crossplane renderer wins on apiVersion match, but a foreign CR with
+  // the same plural needs to fall through to GenericRenderer — otherwise
+  // it renders blank (no Crossplane match + isKnownKind suppresses
+  // generic). Only kinds whose render lines are apiVersion-gated belong
+  // here; `providerconfigs`/`compositionrevisions`/`compositeresource-
+  // definitions` are Crossplane-specific plurals with no realistic
+  // collision and unguarded render lines, so including them would risk
+  // double-render for foreign CRDs we'll never see.
+  const isCollisionGatedKind =
+    kind === 'providers' || kind === 'functions' || kind === 'configurations' || kind === 'compositions'
+  const crossplaneApiVersionMatched = isCollisionGatedKind && (
+    data?.apiVersion?.startsWith('pkg.crossplane.io/')
+    || data?.apiVersion?.startsWith('apiextensions.crossplane.io/')
+  )
+  const crossplaneCollisionFallthrough = isCollisionGatedKind && !crossplaneApiVersionMatched
+
+  const isKnownKind = KNOWN_KINDS.has(kind) || isCrossplaneMR || isCrossplaneClaim || isCrossplaneXR
 
   const PodComp = rendererOverrides?.PodRenderer ?? PodRenderer
   const WorkloadComp = rendererOverrides?.WorkloadRenderer ?? WorkloadRenderer
   const NodeComp = rendererOverrides?.NodeRenderer ?? NodeRenderer
   const ServiceComp = rendererOverrides?.ServiceRenderer ?? ServiceRenderer
+  const CompositeComp = rendererOverrides?.CompositeRenderer ?? CompositeRenderer
+  const ServiceAccountComp = rendererOverrides?.ServiceAccountRenderer ?? ServiceAccountRenderer
+  const RoleComp = rendererOverrides?.RoleRenderer ?? RoleRenderer
+  const RoleBindingComp = rendererOverrides?.RoleBindingRenderer ?? RoleBindingRenderer
+  const NamespaceComp = rendererOverrides?.NamespaceRenderer ?? NamespaceRenderer
+  const HPAComp = rendererOverrides?.HPARenderer ?? HPARenderer
+  const PVCComp = rendererOverrides?.PVCRenderer ?? PVCRenderer
+  const scaleBlockedBy = replicaScalers(relationships?.scalers)
 
   const sidebarContent = showCommonSections && (
     <>
@@ -377,17 +486,26 @@ export function ResourceRendererDispatch({
       <div className={clsx('p-4 space-y-4', renderSidebar && 'lg:flex-1 lg:min-w-0')}>
         {/* Kind-specific content - delegates to modular renderers */}
         {kind === 'pods' && <PodComp data={data} onCopy={onCopy} copied={copied} onNavigate={onNavigate} onOpenLogs={onOpenLogs} resolvedEnvFrom={resolvedEnvFrom} />}
-        {['deployments', 'statefulsets', 'daemonsets'].includes(kind) && <WorkloadComp kind={kind} data={data} onNavigate={onNavigate} />}
+        {['deployments', 'statefulsets', 'daemonsets'].includes(kind) && (
+          <WorkloadComp
+            kind={kind}
+            data={data}
+            onNavigate={onNavigate}
+            relationships={relationships}
+            scaleBlockedBy={scaleBlockedBy}
+          />
+        )}
         {kind === 'replicasets' && <ReplicaSetRenderer data={data} />}
-        {kind === 'services' && !data?.apiVersion?.includes('serving.knative.dev') && <ServiceComp data={data} onCopy={onCopy} copied={copied} />}
+        {kind === 'services' && !data?.apiVersion?.includes('serving.knative.dev') && <ServiceComp data={data} onCopy={onCopy} copied={copied} onNavigate={onNavigate} />}
+        {kind === 'endpointslices' && <EndpointSliceRenderer data={data} onNavigate={onNavigate} />}
         {kind === 'ingresses' && !data?.apiVersion?.includes('networking.internal.knative.dev') && <IngressRenderer data={data} onNavigate={onNavigate} />}
         {kind === 'configmaps' && <ConfigMapRenderer data={data} />}
         {kind === 'secrets' && <SecretRenderer data={data} certificateInfo={certificateInfo} resourceData={data} onSaveSecretValue={onSaveSecretValue} isSaving={isSavingSecret} />}
         {kind === 'jobs' && <JobRenderer data={data} />}
         {kind === 'cronjobs' && <CronJobRenderer data={data} onNavigate={onNavigate} />}
-        {(kind === 'hpas' || kind === 'horizontalpodautoscalers') && <HPARenderer data={data} onNavigate={onNavigate} />}
+        {(kind === 'hpas' || kind === 'horizontalpodautoscalers') && <HPAComp data={data} onNavigate={onNavigate} />}
         {kind === 'nodes' && <NodeComp data={data} relationships={relationships} />}
-        {kind === 'persistentvolumeclaims' && <PVCRenderer data={data} onNavigate={onNavigate} />}
+        {kind === 'persistentvolumeclaims' && <PVCComp data={data} onNavigate={onNavigate} />}
         {kind === 'rollouts' && <RolloutRenderer data={data} />}
         {kind === 'certificates' && !data?.apiVersion?.includes('networking.internal.knative.dev') && <CertificateRenderer data={data} />}
         {kind === 'workflows' && <WorkflowRenderer data={data} />}
@@ -410,9 +528,10 @@ export function ResourceRendererDispatch({
         {(kind === 'ciliumnetworkpolicies' || kind === 'ciliumnetworkpolicy' || kind === 'ciliumclusterwidenetworkpolicies' || kind === 'ciliumclusterwidenetworkpolicy') && <CiliumNetworkPolicyRenderer data={data} />}
         {(kind === 'clusternetworkpolicies' || kind === 'clusternetworkpolicy') && <ClusterNetworkPolicyRenderer data={data} />}
         {kind === 'poddisruptionbudgets' && <PodDisruptionBudgetRenderer data={data} />}
-        {kind === 'serviceaccounts' && <ServiceAccountRenderer data={data} />}
-        {(kind === 'roles' || kind === 'clusterroles') && <RoleRenderer data={data} />}
-        {(kind === 'rolebindings' || kind === 'clusterrolebindings') && <RoleBindingRenderer data={data} onNavigate={onNavigate} />}
+        {kind === 'serviceaccounts' && <ServiceAccountComp data={data} onNavigate={onNavigate} />}
+        {kind === 'namespaces' && <NamespaceComp data={data} onNavigate={onNavigate} />}
+        {(kind === 'roles' || kind === 'clusterroles') && <RoleComp data={data} onNavigate={onNavigate} />}
+        {(kind === 'rolebindings' || kind === 'clusterrolebindings') && <RoleBindingComp data={data} onNavigate={onNavigate} />}
         {kind === 'events' && <EventRenderer data={data} onNavigate={onNavigate} />}
         {kind === 'gitrepositories' && <GitRepositoryRenderer data={data} />}
         {kind === 'ocirepositories' && <OCIRepositoryRenderer data={data} />}
@@ -525,8 +644,23 @@ export function ResourceRendererDispatch({
         {/* Contour */}
         {kind === 'httpproxies' && <ContourHTTPProxyRenderer data={data} onNavigate={onNavigate} />}
 
-        {/* Generic renderer for CRDs and unknown resource types */}
-        {!isKnownKind && <GenericRenderer data={data} />}
+        {/* Crossplane — kind-dispatched for the static package/config kinds, spec-shape
+            detected for MR/XR/Claim (their plurals are unbounded). */}
+        {kind === 'providers' && data?.apiVersion?.startsWith('pkg.crossplane.io/') && <CrossplanePackageRenderer data={data} kindLabel="Provider" onNavigate={onNavigate} />}
+        {kind === 'functions' && data?.apiVersion?.startsWith('pkg.crossplane.io/') && <CrossplanePackageRenderer data={data} kindLabel="Function" onNavigate={onNavigate} />}
+        {kind === 'configurations' && data?.apiVersion?.startsWith('pkg.crossplane.io/') && <CrossplanePackageRenderer data={data} kindLabel="Configuration" onNavigate={onNavigate} />}
+        {kind === 'providerconfigs' && <CrossplaneProviderConfigRenderer data={data} onNavigate={onNavigate} />}
+        {kind === 'compositeresourcedefinitions' && <XRDRenderer data={data} onNavigate={onNavigate} />}
+        {kind === 'compositions' && data?.apiVersion?.startsWith('apiextensions.crossplane.io/') && <CompositionRenderer data={data} onNavigate={onNavigate} />}
+        {kind === 'compositionrevisions' && <CompositionRevisionRenderer data={data} onNavigate={onNavigate} />}
+        {isCrossplaneMR && <ManagedResourceRenderer data={data} onNavigate={onNavigate} />}
+        {(isCrossplaneXR || isCrossplaneClaim) && <CompositeComp data={data} onNavigate={onNavigate} />}
+
+        {/* Generic renderer for CRDs and unknown resource types — also fires
+            for known-plural collisions where no apiVersion-gated renderer
+            matched (e.g. a Knative Configuration sharing the `configurations`
+            plural with Crossplane Configuration). */}
+        {(!isKnownKind || crossplaneCollisionFallthrough) && <GenericRenderer data={data} />}
 
         {/* Common sections - can be disabled when parent handles them separately */}
         {showCommonSections && (
@@ -565,6 +699,16 @@ export function getResourceStatus(kind: string, data: any): { text: string; colo
       return { text: status.text, color: status.color }
     }
     return getServiceStatus(data)
+  }
+  if (k === 'endpointslices') {
+    const endpoints = data.endpoints || []
+    const ready = endpoints.filter((endpoint: any) => endpoint?.conditions?.ready !== false).length
+    const text = endpoints.length === 0 ? 'No endpoints' : `${ready}/${endpoints.length} ready`
+    const color = endpoints.length === 0 ? SEVERITY_BADGE.neutral :
+      ready === endpoints.length ? SEVERITY_BADGE.success :
+      ready > 0 ? SEVERITY_BADGE.warning :
+      SEVERITY_BADGE.error
+    return { text, color }
   }
   if (k === 'jobs') return getJobStatus(data)
   if (k === 'cronjobs') return getCronJobStatus(data)
@@ -661,6 +805,16 @@ export function getResourceStatus(kind: string, data: any): { text: string; colo
   if (k === 'serviceentries') return getServiceEntryStatus(data)
   if (k === 'peerauthentications') return getPeerAuthenticationStatus(data)
   if (k === 'authorizationpolicies') return getAuthorizationPolicyStatus(data)
+
+  // Crossplane — Provider/Function/Configuration share package conditions;
+  // ProviderConfig has its own; MR/XR/Claim detected by spec shape.
+  if ((k === 'providers' || k === 'functions' || k === 'configurations') && data?.apiVersion?.startsWith('pkg.crossplane.io/')) {
+    return getProviderStatus(data)
+  }
+  if (k === 'providerconfigs') return getProviderConfigStatus(data)
+  if (isManagedResource(data) || isComposite(data) || isClaim(data)) {
+    return getCrossplaneStatus(data)
+  }
 
   // Contour HTTPProxy
   if (k === 'httpproxies') {

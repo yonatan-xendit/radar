@@ -251,6 +251,36 @@ func CreatePodGroupNode(group *PodGroup, provider ResourceProvider) Node {
 	}
 }
 
+// CreateOrphanPodSummaryNode creates a single summary-only node for pods that
+// couldn't be attributed to a workload in summary mode (standalone pods, bare
+// ReplicaSets, or controllers whose node wasn't created — e.g. RBAC-denied).
+// It carries counts/status/restarts only — NO per-pod "pods" array and no
+// expand affordance — so a large orphan set can't re-introduce the pod-tier
+// payload/render cost that summary mode exists to avoid.
+func CreateOrphanPodSummaryNode(namespace string, summary PodSummary, totalRestarts int32) Node {
+	status := StatusHealthy
+	if summary.Unhealthy > 0 {
+		status = StatusUnhealthy
+	} else if summary.Degraded > 0 {
+		status = StatusDegraded
+	}
+	return Node{
+		ID:     "podgroup-orphans-" + namespace,
+		Kind:   KindPodGroup,
+		Name:   "unattributed pods",
+		Status: status,
+		Data: map[string]any{
+			"namespace":     namespace,
+			"podCount":      summary.Total,
+			"healthy":       summary.Healthy,
+			"degraded":      summary.Degraded,
+			"unhealthy":     summary.Unhealthy,
+			"totalRestarts": totalRestarts,
+			"summaryOnly":   true,
+		},
+	}
+}
+
 // GetPodGroupID returns the node ID for a pod group
 func GetPodGroupID(group *PodGroup) string {
 	return fmt.Sprintf("podgroup-%s", strings.ReplaceAll(group.Key, "/", "-"))

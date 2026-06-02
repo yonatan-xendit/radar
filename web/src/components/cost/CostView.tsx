@@ -417,7 +417,7 @@ function CostHelpDialog({ onClose }: { onClose: () => void }) {
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center">
       <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={onClose} />
-      <div className="relative dialog max-w-lg w-full mx-4 max-h-[80vh] overflow-y-auto">
+      <div className="relative dialog max-w-2xl w-full mx-4 max-h-[80vh] overflow-y-auto">
         {/* Header */}
         <div className="flex items-center justify-between p-4 border-b border-theme-border sticky top-0 bg-theme-surface rounded-t-lg">
           <div className="flex items-center gap-2">

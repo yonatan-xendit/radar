@@ -6,9 +6,12 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"maps"
 	"net"
 	"os"
 	"os/signal"
+	"sort"
+	"strings"
 	"syscall"
 	"time"
 
@@ -17,6 +20,7 @@ import (
 	"github.com/skyhook-io/radar/internal/cloud"
 	"github.com/skyhook-io/radar/internal/config"
 	"github.com/skyhook-io/radar/internal/k8s"
+	"golang.org/x/net/http/httpguts"
 	_ "k8s.io/client-go/plugin/pkg/client/auth" // Register all auth provider plugins (OIDC, GCP, Azure, etc.)
 	"k8s.io/klog/v2"
 )
@@ -54,11 +58,22 @@ func main() {
 	disableExec := flag.Bool("disable-exec", false, "Simulate restricted exec permissions (disables terminal, debug shell)")
 	disableLocalTerminal := flag.Bool("disable-local-terminal", false, "Disable local terminal feature")
 	podShellDefault := flag.String("pod-shell-default", "", "Override the default pod exec shell command (runs as 'sh -c <value>'; empty = built-in bash -il → ash → sh cascade)")
+	debugImage := flag.String("debug-image", fileCfg.DebugImage, "Image for ephemeral debug containers and node debug pods (empty = busybox:latest; point at a mirror for air-gapped/private-registry clusters)")
+	listPageSize := flag.Int64("list-page-size", 0, "Paginate the initial LIST of high-cardinality kinds (Pods, ReplicaSets) at this page size on clusters without WatchList streaming. 0 = off (single LIST). Try 2000 if a very large cluster fails to sync.")
 	// Timeline storage options
 	timelineStorage := flag.String("timeline-storage", fileCfg.TimelineStorageOr("memory"), "Timeline storage backend: memory or sqlite")
 	timelineDBPath := flag.String("timeline-db", fileCfg.TimelineDBPath, "Path to timeline database file (default: ~/.radar/timeline.db)")
+	timelineRetention := flag.Duration("timeline-retention", fileCfg.TimelineRetentionOr(7*24*time.Hour), "How long to retain timeline events when --timeline-storage=sqlite (e.g. 168h, 720h). 0 disables cleanup (unbounded growth).")
+	timelineMaxSize := flag.String("timeline-max-size", fileCfg.TimelineMaxSizeOr("0"), "Maximum SQLite timeline storage size before pruning oldest events (e.g. 800Mi, 8Gi). 0 disables size-based pruning.")
 	// Traffic/metrics options
 	prometheusURL := flag.String("prometheus-url", fileCfg.PrometheusURL, "Manual Prometheus/VictoriaMetrics URL (skips auto-discovery)")
+	// --prometheus-header Key=Value, repeatable. Defaults populated from
+	// config file; any --prometheus-header flag replaces the file value rather
+	// than merging — matches kubectl semantics (file is the default, CLI wins).
+	promHeaders := newHeaderFlag(fileCfg.PrometheusHeaders)
+	flag.Var(promHeaders, "prometheus-header", "HTTP header to send with Prometheus requests, e.g. 'Authorization=Bearer <token>' (repeatable). Required for auth-protected backends.")
+	promHeadersFromEnv := newHeaderFromEnvFlag(fileCfg.PrometheusHeadersFromEnv)
+	flag.Var(promHeadersFromEnv, "prometheus-header-from-env", "HTTP header to send with Prometheus requests, sourced from an env var, e.g. 'Authorization=PROMETHEUS_TOKEN' (repeatable).")
 	// MCP server
 	noMCP := flag.Bool("no-mcp", !fileCfg.MCPEnabledOr(true), "Disable MCP (Model Context Protocol) server for AI tools")
 	// Auth flags
@@ -72,6 +87,7 @@ func main() {
 	authOIDCClientSecret := flag.String("auth-oidc-client-secret", "", "OIDC client secret")
 	authOIDCRedirectURL := flag.String("auth-oidc-redirect-url", "", "OIDC redirect URL")
 	authOIDCGroupsClaim := flag.String("auth-oidc-groups-claim", "groups", "JWT claim for groups")
+	authOIDCScopes := flag.String("auth-oidc-scopes", "openid,profile,email,groups", "Comma-separated OAuth2 scopes requested at OIDC authorization (e.g. 'openid,profile,email,groups,offline_access')")
 	authOIDCPostLogoutRedirectURL := flag.String("auth-oidc-post-logout-redirect-url", "", "URL to redirect after OIDC provider logout (must be registered with IdP)")
 	authOIDCUsernamePrefix := flag.String("auth-oidc-username-prefix", "", "Prefix added to OIDC username for K8s impersonation (must match kube-apiserver --oidc-username-prefix)")
 	authOIDCGroupsPrefix := flag.String("auth-oidc-groups-prefix", "", "Prefix added to OIDC groups for K8s impersonation (must match kube-apiserver --oidc-groups-prefix)")
@@ -139,43 +155,58 @@ func main() {
 	if *kubeconfig != "" && *kubeconfigDir != "" {
 		log.Fatalf("--kubeconfig and --kubeconfig-dir are mutually exclusive")
 	}
+	timelineMaxSizeBytes, err := config.ParseByteSize(*timelineMaxSize)
+	if err != nil {
+		log.Fatalf("Invalid --timeline-max-size %q: %v", *timelineMaxSize, err)
+	}
+	resolvedPrometheusHeaders, err := app.ResolvePrometheusHeaders(promHeaders.value(), promHeadersFromEnv.value())
+	if err != nil {
+		log.Fatalf("Invalid Prometheus header configuration: %v", err)
+	}
 
 	cfg := app.AppConfig{
-		Kubeconfig:       *kubeconfig,
-		KubeconfigDirs:   app.ParseKubeconfigDirs(*kubeconfigDir),
-		Namespace:        *namespace,
-		Port:             *port,
-		NoBrowser:        *noBrowser,
-		DevMode:          *devMode,
-		HistoryLimit:     *historyLimit,
-		DebugEvents:      *debugEvents,
-		FakeInCluster:    *fakeInCluster,
-		DisableHelmWrite: *disableHelmWrite,
-		DisableExec:          *disableExec,
-		DisableLocalTerminal: *disableLocalTerminal,
-		PodShellDefault:      *podShellDefault,
-		TimelineStorage:  *timelineStorage,
-		TimelineDBPath:   *timelineDBPath,
-		PrometheusURL:    *prometheusURL,
-		MCPEnabled:       !*noMCP,
-		Version:          version,
+		Kubeconfig:               *kubeconfig,
+		KubeconfigDirs:           app.ParseKubeconfigDirs(*kubeconfigDir),
+		Namespace:                *namespace,
+		Port:                     *port,
+		NoBrowser:                *noBrowser,
+		DevMode:                  *devMode,
+		HistoryLimit:             *historyLimit,
+		DebugEvents:              *debugEvents,
+		FakeInCluster:            *fakeInCluster,
+		DisableHelmWrite:         *disableHelmWrite,
+		DisableExec:              *disableExec,
+		DisableLocalTerminal:     *disableLocalTerminal,
+		PodShellDefault:          *podShellDefault,
+		DebugImage:               *debugImage,
+		ListPageSize:             *listPageSize,
+		TimelineStorage:          *timelineStorage,
+		TimelineDBPath:           *timelineDBPath,
+		TimelineRetention:        *timelineRetention,
+		TimelineMaxSizeBytes:     timelineMaxSizeBytes,
+		PrometheusURL:            *prometheusURL,
+		PrometheusHeaders:        resolvedPrometheusHeaders,
+		PrometheusHeadersFromEnv: promHeadersFromEnv.value(),
+		MCPEnabled:               !*noMCP,
+		Version:                  version,
 		AuthConfig: auth.Config{
-			Mode:            *authMode,
-			Secret:          *authSecret,
-			CookieTTL:       *authCookieTTL,
-			UserHeader:      *authUserHeader,
-			GroupsHeader:    *authGroupsHeader,
-			OIDCIssuer:      *authOIDCIssuer,
-			OIDCClientID:    *authOIDCClientID,
-			OIDCClientSecret: *authOIDCClientSecret,
+			Mode:                      *authMode,
+			Secret:                    *authSecret,
+			CookieTTL:                 *authCookieTTL,
+			UserHeader:                *authUserHeader,
+			GroupsHeader:              *authGroupsHeader,
+			OIDCIssuer:                *authOIDCIssuer,
+			OIDCClientID:              *authOIDCClientID,
+			OIDCClientSecret:          *authOIDCClientSecret,
 			OIDCRedirectURL:           *authOIDCRedirectURL,
 			OIDCGroupsClaim:           *authOIDCGroupsClaim,
-			OIDCPostLogoutRedirectURL:  *authOIDCPostLogoutRedirectURL,
-			OIDCUsernamePrefix:         *authOIDCUsernamePrefix,
-			OIDCGroupsPrefix:           *authOIDCGroupsPrefix,
-			OIDCInsecureSkipVerify:     *authOIDCInsecureSkipVerify,
-			OIDCCACert:                 *authOIDCCACert,
-			OIDCBackchannelLogout:      *authOIDCBackchannelLogout,
+			OIDCScopes:                parseCSV(*authOIDCScopes),
+			OIDCPostLogoutRedirectURL: *authOIDCPostLogoutRedirectURL,
+			OIDCUsernamePrefix:        *authOIDCUsernamePrefix,
+			OIDCGroupsPrefix:          *authOIDCGroupsPrefix,
+			OIDCInsecureSkipVerify:    *authOIDCInsecureSkipVerify,
+			OIDCCACert:                *authOIDCCACert,
+			OIDCBackchannelLogout:     *authOIDCBackchannelLogout,
 		},
 	}
 
@@ -260,13 +291,23 @@ func main() {
 					log.Printf("[cloud] panic in cloud tunnel: %v — local Radar continues to serve", r)
 				}
 			}()
+			// Try to discover the external API server URL from
+			// kube-public/cluster-info so the hub can correlate this
+			// cluster against Argo CD's destination references. Best-
+			// effort: empty when the ConfigMap is absent (managed K8s)
+			// or RBAC denies the read. 3s timeout — the connect path
+			// shouldn't block on a single ConfigMap GET.
+			discoverCtx, cancel := context.WithTimeout(rootCtx, 3*time.Second)
+			apiServerURL := cloud.DiscoverAPIServerURL(discoverCtx, k8s.GetClient())
+			cancel()
 			runErr := cloud.Run(rootCtx, cloud.Config{
-				URL:         *cloudURL,
-				Token:       *cloudToken,
-				ClusterID:   *cloudClusterName,
-				ClusterName: *cloudClusterName,
-				Namespace:   os.Getenv("MY_POD_NAMESPACE"),
-				Handler:     srv.Handler(),
+				URL:          *cloudURL,
+				Token:        *cloudToken,
+				ClusterID:    *cloudClusterName,
+				ClusterName:  *cloudClusterName,
+				Namespace:    os.Getenv("MY_POD_NAMESPACE"),
+				APIServerURL: apiServerURL,
+				Handler:      srv.Handler(),
 			})
 			if runErr != nil && !errors.Is(runErr, context.Canceled) {
 				log.Printf("[cloud] tunnel exited: %v", runErr)
@@ -279,4 +320,166 @@ func main() {
 
 	// Block forever (server is running in background)
 	select {}
+}
+
+func parseCSV(s string) []string {
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// headerFlag is a flag.Value that accumulates repeated --prometheus-header
+// Key=Value pairs into a map. The first Set call after construction wipes any
+// defaults populated from the config file (kubectl-style: file = default, CLI
+// wins outright instead of merging).
+type headerFlag struct {
+	m         map[string]string
+	overrides bool
+}
+
+func newHeaderFlag(defaults map[string]string) *headerFlag {
+	out := make(map[string]string, len(defaults))
+	for k, v := range defaults {
+		if !httpguts.ValidHeaderFieldName(k) {
+			log.Printf("[config] Dropping invalid prometheus header name %q (must be RFC 7230 tokens)", k)
+			continue
+		}
+		if !httpguts.ValidHeaderFieldValue(v) {
+			log.Printf("[config] Dropping prometheus header %q: value contains control characters", k)
+			continue
+		}
+		out[k] = v
+	}
+	return &headerFlag{m: out}
+}
+
+// value returns a defensive copy of the accumulated headers (nil if empty).
+func (h *headerFlag) value() map[string]string {
+	if len(h.m) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(h.m))
+	maps.Copy(out, h.m)
+	return out
+}
+
+func (h *headerFlag) String() string {
+	if len(h.m) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(h.m))
+	for k := range h.m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		parts = append(parts, k+"="+h.m[k])
+	}
+	return strings.Join(parts, ",")
+}
+
+func (h *headerFlag) Set(raw string) error {
+	idx := strings.IndexByte(raw, '=')
+	if idx <= 0 {
+		return fmt.Errorf("expected Key=Value, got %q", raw)
+	}
+	key := strings.TrimSpace(raw[:idx])
+	val := raw[idx+1:]
+	if key == "" {
+		return fmt.Errorf("empty header key in %q", raw)
+	}
+	// Reject anything net/http would silently corrupt or refuse at send time
+	// (control bytes, separators in the key, CR/LF in the value — the classic
+	// CRLF-injection vector for header smuggling).
+	if !httpguts.ValidHeaderFieldName(key) {
+		return fmt.Errorf("invalid header name %q (must be RFC 7230 tokens)", key)
+	}
+	if !httpguts.ValidHeaderFieldValue(val) {
+		return fmt.Errorf("invalid header value for %q (control characters not allowed)", key)
+	}
+	if !h.overrides {
+		// First CLI flag wipes file defaults — all-or-nothing replacement.
+		h.m = make(map[string]string)
+		h.overrides = true
+	}
+	h.m[key] = val
+	return nil
+}
+
+type headerFromEnvFlag struct {
+	m         map[string]string
+	overrides bool
+}
+
+func newHeaderFromEnvFlag(defaults map[string]string) *headerFromEnvFlag {
+	out := make(map[string]string, len(defaults))
+	for k, v := range defaults {
+		k = strings.TrimSpace(k)
+		v = strings.TrimSpace(v)
+		if !httpguts.ValidHeaderFieldName(k) {
+			log.Printf("[config] Dropping invalid prometheus header-from-env name %q (must be RFC 7230 tokens)", k)
+			continue
+		}
+		if !app.ValidEnvVarName(v) {
+			log.Printf("[config] Dropping prometheus header-from-env %q: invalid env var name %q", k, v)
+			continue
+		}
+		out[k] = v
+	}
+	return &headerFromEnvFlag{m: out}
+}
+
+func (h *headerFromEnvFlag) value() map[string]string {
+	if len(h.m) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(h.m))
+	maps.Copy(out, h.m)
+	return out
+}
+
+func (h *headerFromEnvFlag) String() string {
+	if len(h.m) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(h.m))
+	for k := range h.m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		parts = append(parts, k+"="+h.m[k])
+	}
+	return strings.Join(parts, ",")
+}
+
+func (h *headerFromEnvFlag) Set(raw string) error {
+	idx := strings.IndexByte(raw, '=')
+	if idx <= 0 {
+		return fmt.Errorf("expected Key=ENV_VAR, got %q", raw)
+	}
+	key := strings.TrimSpace(raw[:idx])
+	envName := strings.TrimSpace(raw[idx+1:])
+	if key == "" {
+		return fmt.Errorf("empty header key in %q", raw)
+	}
+	if !httpguts.ValidHeaderFieldName(key) {
+		return fmt.Errorf("invalid header name %q (must be RFC 7230 tokens)", key)
+	}
+	if !app.ValidEnvVarName(envName) {
+		return fmt.Errorf("invalid env var name %q for header %q", envName, key)
+	}
+	if !h.overrides {
+		h.m = make(map[string]string)
+		h.overrides = true
+	}
+	h.m[key] = envName
+	return nil
 }

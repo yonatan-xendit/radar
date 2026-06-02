@@ -54,6 +54,7 @@ export function Tooltip({
   const triggerRef = useRef<HTMLSpanElement>(null)
   const tooltipRef = useRef<HTMLSpanElement>(null)
   const timeoutRef = useRef<number | null>(null)
+  const hideTimeoutRef = useRef<number | null>(null)
   const rafRef = useRef<number | null>(null)
 
   const updatePosition = useCallback(() => {
@@ -94,12 +95,24 @@ export function Tooltip({
       clearTimeout(timeoutRef.current)
       timeoutRef.current = null
     }
+    if (hideTimeoutRef.current) {
+      clearTimeout(hideTimeoutRef.current)
+      hideTimeoutRef.current = null
+    }
     setIsVisible(false)
     setCoords(null)
   }
 
+  const cancelHide = () => {
+    if (hideTimeoutRef.current) {
+      clearTimeout(hideTimeoutRef.current)
+      hideTimeoutRef.current = null
+    }
+  }
+
   const showTooltip = () => {
     if (disabled || !content) return
+    cancelHide()
     timeoutRef.current = window.setTimeout(() => {
       // Singleton: hide whoever was visible before us, register self
       // as the new active tooltip. Guards against stuck duplicates.
@@ -116,11 +129,24 @@ export function Tooltip({
       clearTimeout(timeoutRef.current)
       timeoutRef.current = null
     }
+    if (hideTimeoutRef.current) {
+      clearTimeout(hideTimeoutRef.current)
+      hideTimeoutRef.current = null
+    }
     if (activeHide === hideRef.current) {
       activeHide = null
     }
     setIsVisible(false)
     setCoords(null)
+  }
+
+  const scheduleHideTooltip = () => {
+    if (timeoutRef.current) {
+      clearTimeout(timeoutRef.current)
+      timeoutRef.current = null
+    }
+    if (hideTimeoutRef.current) return
+    hideTimeoutRef.current = window.setTimeout(hideTooltip, 80)
   }
 
   useEffect(() => {
@@ -143,6 +169,9 @@ export function Tooltip({
     return () => {
       if (timeoutRef.current) {
         clearTimeout(timeoutRef.current)
+      }
+      if (hideTimeoutRef.current) {
+        clearTimeout(hideTimeoutRef.current)
       }
       if (rafRef.current !== null) {
         cancelAnimationFrame(rafRef.current)
@@ -168,6 +197,10 @@ export function Tooltip({
       if (timeoutRef.current) {
         clearTimeout(timeoutRef.current)
         timeoutRef.current = null
+      }
+      if (hideTimeoutRef.current) {
+        clearTimeout(hideTimeoutRef.current)
+        hideTimeoutRef.current = null
       }
       setIsVisible(false)
       setCoords(null)
@@ -202,7 +235,7 @@ export function Tooltip({
         className={clsx('inline-flex max-w-full', wrapperClassName)}
         style={wrapperStyle}
         onMouseEnter={showTooltip}
-        onMouseLeave={hideTooltip}
+        onMouseLeave={scheduleHideTooltip}
         onFocus={showTooltip}
         onBlur={hideTooltip}
         // pointerdown fires before click, so the tooltip is gone before
@@ -218,7 +251,16 @@ export function Tooltip({
             ref={tooltipRef}
             className={clsx(
               'fixed z-[9999] px-2 py-1 text-xs text-theme-text-primary bg-theme-base rounded shadow-lg border border-theme-border',
-              'whitespace-nowrap pointer-events-none',
+              // Cap width + allow wrapping. Long tooltips (multi-sentence
+              // disabled-reason explanations) used to render with
+              // whitespace-nowrap, producing 700+ px wide single-line
+              // tooltips that the viewport collision logic then pushed
+              // away from their trigger to fit on screen — visually
+              // detached from the element they were describing. With
+              // max-w-xs (320px) + whitespace-normal, short tooltips
+              // still fit on one line (content shorter than max-width)
+              // and long ones wrap naturally near the trigger.
+              'max-w-xs whitespace-normal break-words',
               className
             )}
             style={{
@@ -229,6 +271,8 @@ export function Tooltip({
             }}
             role="tooltip"
             aria-hidden={coords ? undefined : true}
+            onMouseEnter={cancelHide}
+            onMouseLeave={scheduleHideTooltip}
           >
             {content}
           </span>,

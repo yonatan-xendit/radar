@@ -1,3 +1,4 @@
+import { useMemo, type ReactNode } from 'react'
 import { useDashboard, useDashboardCRDs, useDashboardHelm } from '../../api/client'
 import type { DashboardResponse } from '../../api/client'
 import type { ExtendedMainView, Topology, SelectedResource } from '../../types'
@@ -9,6 +10,7 @@ import { TrafficSummary } from './TrafficSummary'
 import { CertificateHealthCard } from './CertificateHealthCard'
 import { NetworkPolicyCoverageCard } from './NetworkPolicyCoverageCard'
 import { CostCard } from './CostCard'
+import { GitOpsControllersCard } from './GitOpsControllersCard'
 import { AuditCard, PaneLoader, StatusDot, mapHealthToTone } from '@skyhook-io/k8s-ui'
 import { ClusterHealthCard } from './ClusterHealthCard'
 import { AlertTriangle, Loader2, Shield } from 'lucide-react'
@@ -24,6 +26,21 @@ interface HomeViewProps {
 
 export function HomeView({ namespaces, topology, onNavigateToView, onNavigateToResourceKind, onNavigateToResource }: HomeViewProps) {
   const { data, isLoading, error } = useDashboard(namespaces)
+
+  // SSE is cluster-wide on small/medium clusters; the picker only narrows the
+  // dashboard summary, so re-apply the filter here or the legend disagrees.
+  const scopedTopology = useMemo<Topology | null>(() => {
+    if (!topology) return null
+    if (namespaces.length === 0) return topology
+    const nsSet = new Set(namespaces)
+    const nodes = topology.nodes.filter(n => {
+      const ns = n.data.namespace as string | undefined
+      return !ns || nsSet.has(ns)
+    })
+    const nodeIds = new Set(nodes.map(n => n.id))
+    const edges = topology.edges.filter(e => nodeIds.has(e.source) && nodeIds.has(e.target))
+    return { nodes, edges }
+  }, [topology, namespaces])
   // CRDs and Helm load lazily after main dashboard to keep initial load fast
   const { data: crdsData } = useDashboardCRDs(namespaces)
   const { data: helmData } = useDashboardHelm(namespaces)
@@ -96,70 +113,88 @@ export function HomeView({ namespaces, topology, onNavigateToView, onNavigateToR
         )}>
           {/* Left column: teaser cards */}
           <div className="flex flex-col gap-6 auto-rows-min">
-            {/* Primary cards — 2-col grid */}
+            {/* Live band — Topology + Timeline always render, so a fixed 2-up never strands.
+                These are the richest visuals and the most-used live views, so they get the width. */}
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
               <TopologyPreview
-                topology={topology}
+                topology={scopedTopology}
                 summary={data.topologySummary}
                 onNavigate={() => onNavigateToView('topology')}
               />
-              <HelmSummary
-                data={helmData}
-                onNavigate={() => onNavigateToView('helm')}
-              />
               <ActivitySummary
                 namespaces={namespaces}
-                topology={topology}
+                topology={scopedTopology}
                 onNavigate={() => onNavigateToView('timeline')}
               />
-              <TrafficSummary
-                data={data.trafficSummary}
-                onNavigate={() => onNavigateToView('traffic')}
-              />
-              <CostCard onNavigate={() => onNavigateToView('cost')} />
             </div>
 
-            {/* Health & compliance cards — 3-col when enough cards, 2-col fallback */}
-            {(data.certificateHealth || data.networkPolicyCoverage || data.audit) && (() => {
-              const healthCards = [
-                data.certificateHealth && (
-                  <CertificateHealthCard
-                    key="certs"
-                    data={data.certificateHealth}
-                    onNavigate={() => onNavigateToResourceKind('secrets', undefined, { type: ['TLS'] })}
-                  />
-                ),
-                data.networkPolicyCoverage && (
-                  <NetworkPolicyCoverageCard
-                    key="netpol"
-                    data={data.networkPolicyCoverage}
-                    onNavigate={() => onNavigateToResourceKind('networkpolicies', 'networking.k8s.io')}
-                  />
-                ),
-                data.audit && (
-                  <AuditCard
-                    key="audit"
-                    data={data.audit}
-                    onNavigate={() => onNavigateToView('audit')}
-                  />
-                ),
-              ].filter(Boolean)
+            {/* Explore band — flex-grow wrap so the row always fills. The conditional
+                Cost card self-hides via BandItem's empty:hidden when OpenCost is absent,
+                leaving Traffic + Helm to stretch rather than stranding an empty cell. */}
+            <div className="flex flex-wrap gap-6">
+              <BandItem>
+                <TrafficSummary
+                  data={data.trafficSummary}
+                  onNavigate={() => onNavigateToView('traffic')}
+                />
+              </BandItem>
+              <BandItem>
+                <HelmSummary
+                  data={helmData}
+                  onNavigate={() => onNavigateToView('helm')}
+                />
+              </BandItem>
+              <BandItem>
+                <CostCard onNavigate={() => onNavigateToView('cost')} />
+              </BandItem>
+            </div>
 
-              return (
-                <div className={clsx(
-                  'grid gap-6',
-                  healthCards.length >= 3 ? 'grid-cols-1 sm:grid-cols-2 lg:grid-cols-3' : 'grid-cols-1 sm:grid-cols-2'
-                )}>
-                  {healthCards}
-                </div>
-              )
-            })()}
+            {/* Posture band — same flex-grow wrap so any subset of compliance cards
+                fills its row instead of stranding the last one (the old 3-col grid
+                left Cluster Audit alone with two empty cells beside it). */}
+            {(data.certificateHealth || data.networkPolicyCoverage || data.audit || data.gitopsControllers) && (
+              <div className="flex flex-wrap gap-6">
+                {data.certificateHealth && (
+                  <BandItem>
+                    <CertificateHealthCard
+                      data={data.certificateHealth}
+                      onNavigate={() => onNavigateToResourceKind('secrets', undefined, { type: ['TLS'] })}
+                    />
+                  </BandItem>
+                )}
+                {data.networkPolicyCoverage && (
+                  <BandItem>
+                    <NetworkPolicyCoverageCard
+                      data={data.networkPolicyCoverage}
+                      onNavigate={() => onNavigateToResourceKind('networkpolicies', 'networking.k8s.io')}
+                    />
+                  </BandItem>
+                )}
+                {data.gitopsControllers && (
+                  <BandItem>
+                    <GitOpsControllersCard
+                      data={data.gitopsControllers}
+                      onNavigate={() => onNavigateToView('gitops')}
+                    />
+                  </BandItem>
+                )}
+                {data.audit && (
+                  <BandItem>
+                    <AuditCard
+                      data={data.audit}
+                      onNavigate={() => onNavigateToView('audit')}
+                    />
+                  </BandItem>
+                )}
+              </div>
+            )}
           </div>
 
           {/* Right column: problems panel */}
           {hasProblems && (
             <ProblemsPanel
               problems={data.problems}
+              onNavigateToIssues={() => onNavigateToView('issues')}
               onResourceClick={onNavigateToResource}
             />
           )}
@@ -169,25 +204,42 @@ export function HomeView({ namespaces, topology, onNavigateToView, onNavigateToR
   )
 }
 
+// A self-tiling flex item: grows to share the row, clamps to a sensible min
+// width, and removes itself (empty:hidden) when its card renders null — so a
+// data-gated card (e.g. Cost without OpenCost) can't leave a phantom column.
+function BandItem({ children }: { children: ReactNode }) {
+  return <div className="flex-1 min-w-[260px] empty:hidden [&>*]:w-full">{children}</div>
+}
+
 // ============================================================================
 // Problems Panel (right sidebar, scrollable)
 // ============================================================================
 
 interface ProblemsPanelProps {
   problems: DashboardResponse['problems']
+  onNavigateToIssues: () => void
   onResourceClick: (resource: SelectedResource) => void
 }
 
 
-function ProblemsPanel({ problems, onResourceClick }: ProblemsPanelProps) {
+function ProblemsPanel({ problems, onNavigateToIssues, onResourceClick }: ProblemsPanelProps) {
   return (
     <div className="rounded-xl bg-theme-surface shadow-theme-sm flex flex-col lg:max-h-[calc(100vh-280px)] lg:sticky lg:top-0">
       <div className="flex items-center justify-between px-5 py-3 border-b border-theme-border/50 shrink-0">
         <div className="flex items-center gap-2">
           <AlertTriangle className="w-4 h-4 text-red-500" />
-          <span className="text-xs font-semibold uppercase tracking-wider text-red-500">Unhealthy Workloads</span>
+          <span className="text-xs font-semibold uppercase tracking-wider text-red-500">Active Issues</span>
         </div>
-        <span className="badge status-unhealthy rounded-full">{problems.length}</span>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            className="rounded-md px-2 py-1 text-xs font-medium text-accent-text transition-colors hover:bg-accent-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-radar-accent)]/40"
+            onClick={onNavigateToIssues}
+          >
+            View all
+          </button>
+          <span className="badge status-unhealthy rounded-full">{problems.length}</span>
+        </div>
       </div>
       <div className="overflow-y-auto flex-1 min-h-0">
         <div className="divide-y divide-theme-border">

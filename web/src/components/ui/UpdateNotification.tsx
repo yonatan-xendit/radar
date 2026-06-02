@@ -8,6 +8,7 @@ import {
   useApplyDesktopUpdate,
 } from '../../api/client'
 import type { DesktopUpdateState } from '../../api/client'
+import { WithTooltip } from './Tooltip'
 
 const DISMISSED_KEY = 'radar-update-dismissed'
 
@@ -117,7 +118,7 @@ export function UpdateNotification() {
           <UpdateIcon state={effectiveState} />
         </div>
         <div className="flex-1 min-w-0">
-          <h4 className="text-sm font-medium text-theme-text-primary">
+          <h4 className="text-sm font-medium text-theme-text-primary pr-6">
             <UpdateTitle state={effectiveState} />
           </h4>
           <p className="text-xs text-theme-text-secondary mt-1">
@@ -140,15 +141,30 @@ export function UpdateNotification() {
 
           {/* CLI: show update command with copy button for package managers */}
           {!isDesktop && versionInfo.updateCommand ? (
-            <button
-              onClick={handleCopyCommand}
-              className="flex items-center gap-2 mt-2 px-2 py-1.5 bg-theme-elevated rounded text-xs font-mono text-theme-text-primary hover:bg-theme-surface-hover transition-colors w-full"
-            >
-              <code className="flex-1 text-left truncate">{versionInfo.updateCommand}</code>
-              <CopyIcon copied={copied} failed={copyFailed} />
-            </button>
+            <>
+              <WithTooltip tip={versionInfo.updateCommand} delay={100}>
+                <button
+                  onClick={handleCopyCommand}
+                  className="flex items-center gap-2 mt-2 px-2 py-1.5 bg-theme-elevated rounded font-mono text-theme-text-primary hover:bg-theme-surface-hover transition-colors w-full"
+                >
+                  <code className="inline-code flex-1 truncate text-left text-[11px]">{versionInfo.updateCommand}</code>
+                  <CopyIcon copied={copied} failed={copyFailed} />
+                </button>
+              </WithTooltip>
+              {/* Direct installs may have placed the binary somewhere the install
+                  script won't touch — surface a download link as a fallback. */}
+              {versionInfo.installMethod === 'direct' && versionInfo.releaseUrl && (
+                <a
+                  href={versionInfo.releaseUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center gap-1 mt-1.5 text-xs text-theme-text-tertiary hover:text-theme-text-secondary hover:underline"
+                >
+                  or download from GitHub →
+                </a>
+              )}
+            </>
           ) : (
-            /* Direct download - show release link */
             !isDesktop && versionInfo.releaseUrl && (
               <a
                 href={versionInfo.releaseUrl}
@@ -161,17 +177,18 @@ export function UpdateNotification() {
             )
           )}
         </div>
-        {/* Don't show dismiss during active update */}
-        {effectiveState !== 'downloading' && effectiveState !== 'applying' && (
-          <button
-            onClick={handleDismiss}
-            className="p-1 text-theme-text-secondary hover:text-theme-text-primary hover:bg-theme-elevated rounded shrink-0"
-            aria-label="Dismiss"
-          >
-            <X className="w-4 h-4" />
-          </button>
-        )}
       </div>
+      {/* Dismiss is absolute so it doesn't compress the chip's width.
+          fixed on the parent already establishes the positioning context. */}
+      {effectiveState !== 'downloading' && effectiveState !== 'applying' && (
+        <button
+          onClick={handleDismiss}
+          className="absolute top-2 right-2 p-1 text-theme-text-secondary hover:text-theme-text-primary hover:bg-theme-elevated rounded"
+          aria-label="Dismiss"
+        >
+          <X className="w-4 h-4" />
+        </button>
+      )}
     </div>
   )
 }

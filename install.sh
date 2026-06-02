@@ -70,9 +70,23 @@ fi
 # Install
 if [ -w "$INSTALL_DIR" ]; then
   mv "$BINARY_NAME" "$INSTALL_DIR/"
+  SUDO=""
 else
   echo "Installing to ${INSTALL_DIR} (requires sudo)..."
   sudo mv "$BINARY_NAME" "$INSTALL_DIR/"
+  SUDO="sudo"
+fi
+
+# Symlink so the binary can also be invoked as `radar`. Best-effort —
+# the primary install already succeeded, and `radar` is a common-enough
+# name that we refuse to clobber an unrelated regular file.
+if [ "$OS" != "windows" ]; then
+  if [ -e "$INSTALL_DIR/radar" ] && [ ! -L "$INSTALL_DIR/radar" ]; then
+    echo "Note: ${INSTALL_DIR}/radar already exists and is not a symlink — skipping shorthand. Use 'kubectl-radar' or 'kubectl radar'." >&2
+  else
+    $SUDO ln -sf "$BINARY_NAME" "$INSTALL_DIR/radar" || \
+      echo "Warning: could not create 'radar' symlink — use 'kubectl-radar' or 'kubectl radar'." >&2
+  fi
 fi
 
 # Cleanup
@@ -82,7 +96,7 @@ echo ""
 echo "Radar v${VERSION} installed successfully!"
 echo ""
 echo "Usage:"
+echo "  radar                  # standalone"
 echo "  kubectl radar          # as kubectl plugin"
-echo "  kubectl-radar          # standalone"
 echo ""
-echo "Run 'kubectl radar --help' for more options."
+echo "Run 'radar --help' for more options."

@@ -6,9 +6,16 @@ import { Terminal } from 'lucide-react'
 import {
   WorkloadView as BaseWorkloadView,
   type RendererOverrides,
+  type GitOpsOwnerRef,
+  type GitOpsStatus,
+  type HelmOwnerRef,
+  gitOpsRouteForOwner,
+  gitOpsOwnerFromRelationships,
+  getGitOpsResourceStatus,
+  resolvedEnvFromKey,
 } from '@skyhook-io/k8s-ui'
-import type { SelectedResource, ResourceRef, ResolvedEnvFrom } from '../../types'
-import { kindToPlural, type NavigateToResource } from '../../utils/navigation'
+import type { SelectedResource, ResourceRef, Relationships, ResolvedEnvFrom } from '../../types'
+import { kindToPlural, buildWorkloadPath, type NavigateToResource } from '../../utils/navigation'
 import {
   useChanges, useResourceWithRelationships, usePodLogs, useTopology, useUpdateResource,
   useDeleteResource, useTriggerCronJob, useSuspendCronJob, useResumeCronJob,
@@ -18,10 +25,14 @@ import {
   useCordonNode, useUncordonNode, useDrainNode,
   useCascadeDeletePreview,
   useResourceEvents,
+  useResource,
   fetchJSON,
 } from '../../api/client'
 import { PrometheusCharts, isPrometheusSupported } from '../resource/PrometheusCharts'
-import { useResourceAudit } from '../../api/client'
+import { PrometheusChartsGrid } from '../resource/PrometheusChartsGrid'
+import { RestartEventLane } from '../resource/RestartChart'
+import { RightsizingStrip } from '../resource/RightsizingStrip'
+import { useResourceAudit, useResources } from '../../api/client'
 import { AuditAlerts } from '@skyhook-io/k8s-ui'
 import { WorkloadLogsViewer } from '../logs/WorkloadLogsViewer'
 import { LogsViewer } from '../logs/LogsViewer'
@@ -33,14 +44,30 @@ import { PodRenderer } from '../resources/renderers/PodRenderer'
 import { NodeRenderer } from '../resources/renderers/NodeRenderer'
 import { ServiceRenderer } from '../resources/renderers/ServiceRenderer'
 import { WorkloadRenderer } from '../resources/renderers/WorkloadRenderer'
+import { CompositeRenderer } from '../resources/CompositeRenderer'
+import { ServiceAccountRenderer } from '../resources/renderers/ServiceAccountRenderer'
+import { RoleRenderer } from '../resources/renderers/RoleRenderer'
+import { RoleBindingRenderer } from '../resources/renderers/RoleBindingRenderer'
+import { NamespaceRenderer } from '../resources/renderers/NamespaceRenderer'
+import { HPARenderer } from '../resources/renderers/HPARenderer'
+import { PVCRenderer } from '../resources/renderers/PVCRenderer'
 import { CreateResourceDialog } from '../shared/CreateResourceDialog'
 import { cleanYamlForDuplicate } from '../../utils/skeleton-yaml'
+import { useDesktopDownload } from '../../hooks/useDesktopDownload'
+import { useCompareLauncher } from '../compare/useCompareLauncher'
+import { apiVersionToGroup } from '../../utils/navigation'
 
 type TabType = 'overview' | 'timeline' | 'logs' | 'metrics' | 'yaml'
 
 // Stable reference — web renderer wrappers inject platform hooks internally
 const rendererOverrides: RendererOverrides = {
-  PodRenderer, NodeRenderer, ServiceRenderer, WorkloadRenderer,
+  PodRenderer, NodeRenderer, ServiceRenderer, WorkloadRenderer, CompositeRenderer,
+  ServiceAccountRenderer,
+  RoleRenderer,
+  RoleBindingRenderer,
+  NamespaceRenderer,
+  HPARenderer,
+  PVCRenderer,
 }
 
 // ============================================================================
@@ -54,13 +81,19 @@ interface WorkloadViewRouteProps {
 export function WorkloadViewRoute({ onNavigateToResource }: WorkloadViewRouteProps) {
   const location = useLocation()
   const navigate = useNavigate()
+  const [searchParams] = useSearchParams()
 
-  // Parse /workload/:kind/:ns/:name from pathname
+  // Parse /workload/:kind/:ns/:name from pathname. Segments are URL-encoded by
+  // buildWorkloadPath; names can also contain literal slashes (e.g. some CRD names),
+  // which survive encoding as %2F and reassemble correctly here.
   const parts = location.pathname.replace(/^\//, '').split('/')
-  // parts[0] = 'workload', parts[1] = kind, parts[2] = ns, parts[3+] = name (may contain slashes)
-  const kind = parts[1] || ''
-  const namespace = parts[2] || ''
-  const name = parts.slice(3).join('/') || ''
+  const decode = (s: string): string => {
+    try { return decodeURIComponent(s) } catch { return s }
+  }
+  const kind = decode(parts[1] ?? '')
+  const namespace = decode(parts[2] ?? '')
+  const name = parts.slice(3).map(decode).join('/')
+  const group = searchParams.get('apiGroup') || ''
 
   if (!kind || !namespace || !name) {
     return (
@@ -79,8 +112,7 @@ export function WorkloadViewRoute({ onNavigateToResource }: WorkloadViewRoutePro
   }, [navigate])
 
   const handleNavigate = useCallback((resource: SelectedResource) => {
-    // Navigate to another workload view
-    navigate(`/workload/${resource.kind}/${resource.namespace}/${resource.name}`)
+    navigate(buildWorkloadPath(resource))
   }, [navigate])
 
   return (
@@ -88,6 +120,7 @@ export function WorkloadViewRoute({ onNavigateToResource }: WorkloadViewRoutePro
       kind={kind}
       namespace={namespace}
       name={name}
+      group={group}
       onBack={handleBack}
       onNavigateToResource={onNavigateToResource || handleNavigate}
     />
@@ -228,10 +261,65 @@ export function WorkloadView({
   }, [searchParams, setSearchParams])
 
   // Fetch resource with relationships
-  const { data: resourceResponse, isLoading: resourceLoading, refetch: refetchResource } = useResourceWithRelationships<any>(kindProp, namespace, name, rest.group)
+  const { data: resourceResponse, isLoading: resourceLoading, error: resourceError, refetch: refetchResource } = useResourceWithRelationships<any>(kindProp, namespace, name, rest.group)
   const resource = resourceResponse?.resource
   const relationships = resourceResponse?.relationships
   const certificateInfo = resourceResponse?.certificateInfo
+  const relationshipGitopsOwner = useMemo(() => gitOpsOwnerFromRelationships(relationships), [relationships])
+  const inheritedGitOpsLookupRef = useMemo(
+    () => findInheritedGitOpsLookupRef(relationships, relationshipGitopsOwner, { kind: kindProp, namespace, name, group: rest.group }),
+    [relationships, relationshipGitopsOwner, kindProp, namespace, name, rest.group],
+  )
+  const inheritedGitOpsResponse = useResourceWithRelationships<any>(
+    inheritedGitOpsLookupRef ? kindToPlural(inheritedGitOpsLookupRef.kind) : '',
+    inheritedGitOpsLookupRef?.namespace ?? '',
+    inheritedGitOpsLookupRef?.name ?? '',
+    inheritedGitOpsLookupRef?.group,
+  )
+  const inheritedGitopsOwner = useMemo(
+    () => gitOpsOwnerFromRelationships(inheritedGitOpsResponse.data?.relationships),
+    [inheritedGitOpsResponse.data?.relationships],
+  )
+  const relationshipHelmOwner = useMemo(
+    () => nativeHelmOwnerFromRelationships(relationships, resource?.metadata?.namespace ?? namespace),
+    [relationships, resource?.metadata?.namespace, namespace],
+  )
+  const inheritedHelmOwner = useMemo(
+    () => nativeHelmOwnerFromRelationships(inheritedGitOpsResponse.data?.relationships, inheritedGitOpsResponse.data?.resource?.metadata?.namespace ?? namespace),
+    [inheritedGitOpsResponse.data?.relationships, inheritedGitOpsResponse.data?.resource?.metadata?.namespace, namespace],
+  )
+  const rawGitopsOwner = relationshipGitopsOwner ?? inheritedGitopsOwner
+  const gitOpsSourceResource = relationshipGitopsOwner ? resource : inheritedGitOpsResponse.data?.resource
+  const helmOwner = relationshipHelmOwner ?? inheritedHelmOwner
+  const helmSourceResource = relationshipHelmOwner ? resource : inheritedGitOpsResponse.data?.resource
+  const shouldResolveArgoOwner = rawGitopsOwner?.tool === 'argocd' && !rawGitopsOwner.namespace
+  const { data: argoApplications } = useResources<any>('applications', undefined, 'argoproj.io', { enabled: shouldResolveArgoOwner })
+  const gitopsOwner = useMemo(
+    () => resolveGitOpsOwner(rawGitopsOwner, argoApplications),
+    [rawGitopsOwner, argoApplications],
+  )
+  const gitopsOwnerGroup = gitopsOwner ? gitOpsOwnerGroup(gitopsOwner) : ''
+  const shouldFetchGitOpsOwner = Boolean(gitopsOwner?.namespace)
+  const gitopsOwnerQuery = useResource<any>(
+    shouldFetchGitOpsOwner ? gitopsOwner!.kind : '',
+    gitopsOwner?.namespace ?? '',
+    gitopsOwner?.name ?? '',
+    gitopsOwnerGroup,
+  )
+  const gitOpsOwnerStatus = useMemo(
+    () => deriveGitOpsOwnerStatus(gitopsOwner, gitopsOwnerQuery.data),
+    [gitopsOwner, gitopsOwnerQuery.data],
+  )
+  const gitOpsOwnerVerified = Boolean(gitopsOwner?.namespace && gitopsOwnerQuery.data)
+  const gitOpsOwnerPending = Boolean(gitopsOwner?.namespace && gitopsOwnerQuery.isLoading && !gitopsOwnerQuery.data)
+  const gitOpsOwnerSource = useMemo(
+    () => describeGitOpsOwnerSource(rawGitopsOwner, gitOpsSourceResource),
+    [rawGitopsOwner, gitOpsSourceResource],
+  )
+  const helmOwnerSource = useMemo(
+    () => describeHelmOwnerSource(helmOwner, helmSourceResource),
+    [helmOwner, helmSourceResource],
+  )
 
   // For pods: extract envFrom ConfigMap/Secret names and resolve their keys
   const isPod = kindProp.toLowerCase() === 'pods'
@@ -273,7 +361,7 @@ export function WorkloadView({
     envFromConfigMapNames.forEach((n, i) => {
       // Single-resource endpoint returns { resource, relationships } wrapper
       const cm = configMapQueries[i]?.data?.resource ?? configMapQueries[i]?.data
-      if (cm) result[n] = { keys: Object.keys(cm.data || {}), values: cm.data || {}, isSecret: false }
+      if (cm) result[resolvedEnvFromKey('configmap', n)] = { keys: Object.keys(cm.data || {}), values: cm.data || {}, isSecret: false }
     })
     envFromSecretNames.forEach((n, i) => {
       const secret = secretQueries[i]?.data?.resource ?? secretQueries[i]?.data
@@ -282,7 +370,7 @@ export function WorkloadView({
         for (const [k, v] of Object.entries(secret.data || {})) {
           try { decodedValues[k] = atob(v as string) } catch { decodedValues[k] = v as string }
         }
-        result[n] = { keys: Object.keys(decodedValues), values: decodedValues, isSecret: true }
+        result[resolvedEnvFromKey('secret', n)] = { keys: Object.keys(decodedValues), values: decodedValues, isSecret: true }
       }
     })
     return Object.keys(result).length > 0 ? result : undefined
@@ -314,11 +402,55 @@ export function WorkloadView({
   // RBAC
   const canUpdateSecrets = useCanUpdateSecrets()
   const updateResource = useUpdateResource()
-  const actionsBarProps = useActionsBarProps(kindProp, namespace, name)
+  const baseActionsBarProps = useActionsBarProps(kindProp, namespace, name)
+  const desktopDownload = useDesktopDownload()
+
+  const resourceGroup = useMemo(
+    () => (resource?.apiVersion ? apiVersionToGroup(resource.apiVersion) : undefined),
+    [resource?.apiVersion],
+  )
+  const { onCompareTo, onCompareAcrossClusters, picker: comparePicker } = useCompareLauncher({
+    kind: kindProp,
+    namespace,
+    name,
+    // Prefer the URL-supplied group so Compare works even before the resource
+    // fetch completes; fall back to the derived group for callers that don't
+    // pass one.
+    group: rest.group || resourceGroup || undefined,
+  })
+  const actionsBarProps = useMemo(
+    () => ({ ...baseActionsBarProps, onCompareTo, onCompareAcrossClusters }),
+    [baseActionsBarProps, onCompareTo, onCompareAcrossClusters],
+  )
 
   const handleUpdateResource = useCallback(async (params: { kind: string; namespace: string; name: string; yaml: string }) => {
     await updateResource.mutateAsync(params)
   }, [updateResource])
+
+  const navigateRouter = useNavigate()
+  const handleOpenGitOpsResource = useCallback(
+    (ref: GitOpsOwnerRef) => {
+      const params = new URLSearchParams()
+      const namespaces = searchParams.get('namespaces')
+      if (namespaces) params.set('namespaces', namespaces)
+      navigateRouter({ pathname: gitOpsRouteForOwner(ref), search: params.toString() })
+    },
+    [navigateRouter, searchParams],
+  )
+  const handleNavigateGitOpsPath = useCallback(
+    (path: string) => navigateRouter(path),
+    [navigateRouter],
+  )
+  const handleOpenHelmRelease = useCallback(
+    (ref: HelmOwnerRef) => {
+      const params = new URLSearchParams()
+      const namespaces = searchParams.get('namespaces')
+      if (namespaces) params.set('namespaces', namespaces)
+      params.set('release', `${ref.namespace}/${ref.name}`)
+      navigateRouter({ pathname: '/helm', search: params.toString() })
+    },
+    [navigateRouter, searchParams],
+  )
 
   // Duplicate dialog
   const [duplicateDialogOpen, setDuplicateDialogOpen] = useState(false)
@@ -342,6 +474,7 @@ export function WorkloadView({
       relationships={relationships}
       certificateInfo={certificateInfo}
       isLoading={resourceLoading}
+      resourceError={resourceError}
       refetch={refetchResource}
       // Timeline
       allEvents={allEvents}
@@ -364,18 +497,32 @@ export function WorkloadView({
       // Render props
       renderLogsTab={(props) => <LogsTabContent {...props} />}
       renderMetricsTab={({ kind, namespace: ns, name: n }) => (
-        <PrometheusCharts kind={kind} namespace={ns} name={n} showEmptyState />
+        <MetricsTabContent kind={kind} namespace={ns} name={n} resource={resource} expanded={expanded} />
       )}
       isMetricsAvailable={(kind, res) =>
         isPrometheusSupported(kind) && !(kind === 'Pod' && res?.status?.phase === 'Pending')
       }
       onDuplicate={handleDuplicate}
+      onDownload={desktopDownload}
       actionsBarProps={actionsBarProps}
       rendererOverrides={rendererOverrides}
       resolvedEnvFrom={resolvedEnvFrom}
       renderOverviewExtra={({ kind: k, namespace: ns, name: n }) => (
-        <AuditSection kind={k} namespace={ns} name={n} />
+        <>
+          <AuditSection kind={k} namespace={ns} name={n} />
+          <FluxSourceConsumersSection kind={k} namespace={ns} name={n} />
+        </>
       )}
+      onOpenGitOpsResource={gitopsOwnerQuery.data ? handleOpenGitOpsResource : undefined}
+      resolvedGitOpsOwner={gitopsOwner}
+      gitOpsOwnerVerified={gitOpsOwnerVerified}
+      gitOpsOwnerPending={gitOpsOwnerPending}
+      gitOpsOwnerSource={gitOpsOwnerSource}
+      gitOpsOwnerStatus={gitOpsOwnerStatus}
+      helmOwner={helmOwner}
+      helmOwnerSource={helmOwnerSource}
+      onOpenHelmRelease={handleOpenHelmRelease}
+      onNavigateGitOpsPath={handleNavigateGitOpsPath}
     />
     <CreateResourceDialog
       open={duplicateDialogOpen}
@@ -386,8 +533,107 @@ export function WorkloadView({
         rest.onNavigateToResource?.({ kind: kindToPlural(result.kind), namespace: result.namespace, name: result.name, group: '' })
       }}
     />
+    {comparePicker}
     </>
   )
+}
+
+function resolveGitOpsOwner(owner: GitOpsOwnerRef | null, argoApplications: any[] | undefined): GitOpsOwnerRef | null {
+  if (!owner || owner.namespace || owner.tool !== 'argocd') return owner
+  const matches = (argoApplications ?? []).filter((app) => app?.metadata?.name === owner.name)
+  if (matches.length !== 1) return owner
+  const namespace = matches[0]?.metadata?.namespace
+  return namespace ? { ...owner, namespace } : owner
+}
+
+function findInheritedGitOpsLookupRef(
+  relationships: Relationships | undefined,
+  directOwner: GitOpsOwnerRef | null,
+  current: ResourceRef,
+): ResourceRef | null {
+  if (directOwner) return null
+  const inheritedManagerRefs = (relationships?.managedBy ?? []).filter((ref) =>
+    !gitOpsOwnerFromRelationships({ managedBy: [ref] })
+    && !isNativeHelmManager(ref)
+  )
+  const candidates = [
+    relationships?.deployment,
+    ...inheritedManagerRefs,
+    relationships?.owner,
+  ].filter(Boolean) as ResourceRef[]
+
+  return candidates.find((ref) => !isCurrentResource(ref, current)) ?? null
+}
+
+function nativeHelmOwnerFromRelationships(relationships: Relationships | undefined, fallbackNamespace: string): HelmOwnerRef | null {
+  const ref = relationships?.managedBy?.[0]
+  if (!ref || !isNativeHelmManager(ref)) return null
+  return {
+    namespace: ref.namespace || fallbackNamespace,
+    name: ref.name,
+  }
+}
+
+function isCurrentResource(ref: ResourceRef, current: ResourceRef): boolean {
+  return kindToPlural(ref.kind) === kindToPlural(current.kind)
+    && ref.namespace === current.namespace
+    && ref.name === current.name
+    && (ref.group ?? '') === (current.group ?? '')
+}
+
+function isNativeHelmManager(ref: ResourceRef): boolean {
+  return ref.kind === 'HelmRelease' && ref.group !== 'helm.toolkit.fluxcd.io'
+}
+
+function describeGitOpsOwnerSource(owner: GitOpsOwnerRef | null, resource: any): string | null {
+  if (!owner || !resource) return null
+  const labels = resource.metadata?.labels ?? {}
+  const annotations = resource.metadata?.annotations ?? {}
+
+  if (owner.tool === 'fluxcd') {
+    const nameKey = owner.kind === 'helmreleases' ? 'helm.toolkit.fluxcd.io/name' : 'kustomize.toolkit.fluxcd.io/name'
+    const nsKey = owner.kind === 'helmreleases' ? 'helm.toolkit.fluxcd.io/namespace' : 'kustomize.toolkit.fluxcd.io/namespace'
+    if (labels[nameKey] || labels[nsKey]) {
+      return `${nameKey}=${labels[nameKey] ?? ''}, ${nsKey}=${labels[nsKey] ?? ''}`
+    }
+  }
+
+  const trackingID = annotations['argocd.argoproj.io/tracking-id']
+  if (trackingID) return `argocd.argoproj.io/tracking-id=${trackingID}`
+  const argoInstance = labels['argocd.argoproj.io/instance']
+  if (argoInstance) return `argocd.argoproj.io/instance=${argoInstance}`
+  return null
+}
+
+function describeHelmOwnerSource(owner: HelmOwnerRef | null, resource: any): string | null {
+  if (!owner || !resource) return null
+  const annotations = resource.metadata?.annotations ?? {}
+  const releaseName = annotations['meta.helm.sh/release-name']
+  const releaseNamespace = annotations['meta.helm.sh/release-namespace']
+  if (releaseName || releaseNamespace) {
+    return `meta.helm.sh/release-name=${releaseName ?? ''}, meta.helm.sh/release-namespace=${releaseNamespace ?? ''}`
+  }
+  return null
+}
+
+function gitOpsOwnerGroup(owner: GitOpsOwnerRef): string {
+  if (owner.tool === 'argocd') return 'argoproj.io'
+  if (owner.kind === 'kustomizations') return 'kustomize.toolkit.fluxcd.io'
+  return 'helm.toolkit.fluxcd.io'
+}
+
+function deriveGitOpsOwnerStatus(owner: GitOpsOwnerRef | null, resource: any): GitOpsStatus | null {
+  if (!owner || !resource || !hasGitOpsStatusPayload(owner, resource)) return null
+  return getGitOpsResourceStatus(owner.kind, resource)
+}
+
+function hasGitOpsStatusPayload(owner: GitOpsOwnerRef, resource: any): boolean {
+  if (owner.kind === 'applications') {
+    const status = resource.status ?? {}
+    return Boolean(status.sync?.status || status.health?.status || status.operationState?.phase)
+  }
+  if (resource.spec?.suspend === true) return true
+  return Array.isArray(resource.status?.conditions) && resource.status.conditions.length > 0
 }
 
 // ============================================================================
@@ -546,3 +792,160 @@ function AuditSection({ kind, namespace, name }: { kind: string; namespace: stri
   if (!findings || findings.length === 0) return null
   return <AuditAlerts findings={findings} onViewAll={() => navigate('/audit')} />
 }
+
+// FluxSourceConsumersSection lists the reconcilers (Kustomization, HelmRelease)
+// that reference this Flux source CR — the inverse of `spec.sourceRef`. Renders
+// only when the focused resource is a Flux source kind; otherwise null. Sources
+// can have many consumers (one repo feeding multiple apps), so this answers
+// "if I edit this source, what gets affected on the next reconcile?".
+//
+// Filtering happens client-side off the namespaced reconciler lists — these
+// are typically small (tens, not thousands) and the dynamic informer cache
+// makes the request cheap. If a cluster ever has thousands of HelmReleases,
+// a dedicated /api/gitops/consumers endpoint would be the right move; today
+// it'd be premature.
+// Outer component is cheap — it does only the kind check and decides whether
+// to mount the data-fetching child. Without this split, useResources would
+// fire two API calls on EVERY workload drawer open (Pod, Deployment, Service,
+// …), since the hook has no `enabled` flag and can't be conditionally called
+// (Rules of Hooks). The hooks only need to run when the focused resource is
+// actually a Flux source CR.
+function FluxSourceConsumersSection({ kind, namespace, name }: { kind: string; namespace: string; name: string }) {
+  // The inner WorkloadView de-pluralizes the URL's plural form, which gives
+  // "Gitrepository" (single-uppercase) rather than the wire-correct
+  // "GitRepository" — so we match lowercase. spec.sourceRef.kind on consumers
+  // is always wire-correct, so we look that up separately.
+  const sourceKind = FLUX_SOURCE_KIND_BY_LOWER.get(kind.toLowerCase()) ?? null
+  if (!sourceKind) return null
+  return <FluxSourceConsumersInner sourceKind={sourceKind} namespace={namespace} name={name} />
+}
+
+function FluxSourceConsumersInner({ sourceKind, namespace, name }: { sourceKind: string; namespace: string; name: string }) {
+  const navigate = useNavigate()
+  const { data: kustomizations } = useResources<any>('kustomizations', undefined, 'kustomize.toolkit.fluxcd.io')
+  const { data: helmReleases } = useResources<any>('helmreleases', undefined, 'helm.toolkit.fluxcd.io')
+
+  const consumers: Array<{ kind: 'Kustomization' | 'HelmRelease'; namespace: string; name: string; plural: string }> = []
+  for (const k of kustomizations ?? []) {
+    const ref = k?.spec?.sourceRef ?? {}
+    const refNs = ref.namespace || k?.metadata?.namespace
+    if (ref.kind === sourceKind && ref.name === name && refNs === namespace) {
+      consumers.push({ kind: 'Kustomization', namespace: k.metadata.namespace, name: k.metadata.name, plural: 'kustomizations' })
+    }
+  }
+  for (const h of helmReleases ?? []) {
+    const ref = h?.spec?.chart?.spec?.sourceRef ?? {}
+    const refNs = ref.namespace || h?.metadata?.namespace
+    if (ref.kind === sourceKind && ref.name === name && refNs === namespace) {
+      consumers.push({ kind: 'HelmRelease', namespace: h.metadata.namespace, name: h.metadata.name, plural: 'helmreleases' })
+    }
+  }
+
+  if (consumers.length === 0) {
+    return (
+      <div className="rounded-lg border border-theme-border bg-theme-elevated/40 p-3 text-xs text-theme-text-tertiary">
+        Consumed by — no Kustomization or HelmRelease references this source.
+      </div>
+    )
+  }
+
+  return (
+    <div className="rounded-lg border border-theme-border bg-theme-elevated/40 p-3">
+      <h3 className="mb-2 text-xs font-medium text-theme-text-secondary">
+        Consumed by ({consumers.length})
+      </h3>
+      <div className="flex flex-wrap gap-1.5">
+        {consumers.map((c) => (
+          <button
+            key={`${c.kind}/${c.namespace}/${c.name}`}
+            onClick={() => navigate(`/gitops/detail/${c.plural}/${encodeURIComponent(c.namespace)}/${encodeURIComponent(c.name)}`)}
+            className="inline-flex items-center gap-1.5 rounded border border-theme-border bg-theme-surface px-1.5 py-0.5 text-[11px] text-theme-text-secondary hover:border-skyhook-500/60 hover:text-skyhook-500 transition-colors"
+            title={`${c.kind} ${c.namespace}/${c.name}`}
+          >
+            <span className="text-theme-text-tertiary">{c.kind === 'HelmRelease' ? 'HR' : 'K'}</span>
+            <span>{c.namespace}/{c.name}</span>
+          </button>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+// Drawer mode: single chart + category tabs (compact for ~500px width).
+// Full-screen mode: multi-chart grid so CPU + Memory + Network can be
+// compared side-by-side without tab switching.
+function MetricsTabContent({ kind, namespace, name, resource, expanded }: {
+  kind: string
+  namespace: string
+  name: string
+  resource: any
+  expanded: boolean
+}) {
+  const showRightsizing = expanded && ['Deployment', 'StatefulSet', 'DaemonSet'].includes(kind)
+
+  if (expanded) {
+    return (
+      <div className="flex flex-col h-full">
+        {showRightsizing && (
+          <div className="px-4 pt-4">
+            <RightsizingStrip kind={kind} namespace={namespace} name={name} />
+          </div>
+        )}
+        <div className="flex-1 min-h-0">
+          <PrometheusChartsGrid
+            kind={kind}
+            namespace={namespace}
+            name={name}
+            resource={resource}
+          />
+        </div>
+      </div>
+    )
+  }
+
+  // Drawer fallback: single chart with tabs + restart lane below. The chart's
+  // time-range selector is mirrored to the restart lane so they stay aligned.
+  return (
+    <DrawerMetricsContent
+      kind={kind}
+      namespace={namespace}
+      name={name}
+      resource={resource}
+    />
+  )
+}
+
+function DrawerMetricsContent({ kind, namespace, name, resource }: {
+  kind: string
+  namespace: string
+  name: string
+  resource: any
+}) {
+  const [chartRange, setChartRange] = useState<import('../../api/client').PrometheusTimeRange>('1h')
+  const showRestartLane = isPrometheusSupported(kind) && kind !== 'Node'
+
+  return (
+    <div className="flex flex-col h-full">
+      <div className="flex-1 min-h-0">
+        <PrometheusCharts kind={kind} namespace={namespace} name={name} showEmptyState resource={resource} onTimeRangeChange={setChartRange} />
+      </div>
+      {showRestartLane && (
+        <div className="px-4 pb-4">
+          <RestartEventLane kind={kind} namespace={namespace} name={name} range={chartRange} />
+        </div>
+      )}
+    </div>
+  )
+}
+
+// FLUX_SOURCE_KIND_BY_LOWER maps lowercase kind (what the inner WorkloadView
+// produces via its plural-to-singular fallback) to the wire-correct
+// PascalCase form that consumers carry in spec.sourceRef.kind. HelmChart is
+// intentionally absent — it's an auto-generated internal CR, not something
+// users create or point reconcilers at directly.
+const FLUX_SOURCE_KIND_BY_LOWER = new Map<string, string>([
+  ['gitrepository', 'GitRepository'],
+  ['helmrepository', 'HelmRepository'],
+  ['ocirepository', 'OCIRepository'],
+  ['bucket', 'Bucket'],
+])

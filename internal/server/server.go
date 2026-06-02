@@ -15,6 +15,7 @@ import (
 	"reflect"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -39,9 +40,11 @@ import (
 	prometheuspkg "github.com/skyhook-io/radar/internal/prometheus"
 	"github.com/skyhook-io/radar/internal/settings"
 	"github.com/skyhook-io/radar/internal/timeline"
-	topology "github.com/skyhook-io/radar/pkg/topology"
 	"github.com/skyhook-io/radar/internal/updater"
 	"github.com/skyhook-io/radar/internal/version"
+	"github.com/skyhook-io/radar/pkg/perfstats"
+	"github.com/skyhook-io/radar/pkg/rbac"
+	topology "github.com/skyhook-io/radar/pkg/topology"
 )
 
 // Server is the Explorer HTTP server
@@ -61,6 +64,29 @@ type Server struct {
 	permCache       *auth.PermissionCache
 	oidcHandler     *auth.OIDCHandler
 	saveFileFunc    func(defaultFilename string, data []byte) (string, error)
+
+	// nsPreferences holds each user's active-namespace pick from the in-app
+	// switcher. Key shape: "<username>\x00<contextName>" when auth is enabled,
+	// "\x00<contextName>" when auth is disabled. Cleared on context switch
+	// (new cluster ⇒ old picks meaningless). The pick is a per-user view
+	// filter — intersected with the user's RBAC-allowed namespaces at read
+	// time. Picking does NOT narrow the shared informer cache (would corrupt
+	// other users' views).
+	nsPreferences sync.Map
+
+	// Short-TTL cache for topology builds. The Topology graph is a
+	// deterministic projection of the informer cache; rebuilding it walks
+	// every resource of every kind. A 5s TTL absorbs the typical bursts
+	// (page-load tree+insights, in-flight 2s polling, dashboard widgets)
+	// without user-visible staleness — controllers reconcile far slower.
+	topoMemo *topology.Memoizer
+
+	// Short-TTL cache for the RBAC reverse-lookup index. A SA detail
+	// page fires multiple /api/rbac/* calls in quick succession (subject
+	// lookup + role lookup for each linked role); cache absorbs the
+	// burst. Index is a pure projection of four cached listers — TTL has
+	// no semantic effect.
+	rbacMemo *rbac.Memoizer
 }
 
 // Config holds server configuration
@@ -89,11 +115,27 @@ func New(cfg Config) *Server {
 		diagConfig:      cfg.DiagConfig,
 		effectiveConfig: cfg.EffectiveConfig,
 		authConfig:      cfg.AuthConfig,
+		topoMemo:        topology.NewMemoizer(5 * time.Second),
+		rbacMemo:        rbac.NewMemoizer(5 * time.Second),
 	}
+
+	// Register a single context-switch callback so every PerformContextSwitch
+	// path (REST switch, CAPI connect, periodic re-auth, …) gets per-user
+	// state cleared automatically. Fires inside step 5 of the swap, strictly
+	// before PerformContextSwitch returns. Mirrors the MCP package's pattern
+	// for mcpPermCache.
+	k8s.OnContextSwitch(func(_ string) {
+		s.finalizePostContextSwitch()
+	})
 
 	// Initialize auth components when auth is enabled
 	if s.authConfig.Enabled() {
-		s.permCache = auth.NewPermissionCache()
+		// Stamp cache entries with the current K8s context so an in-flight
+		// request mid-context-switch can't use the previous cluster's
+		// AllowedNamespaces / canI results to authorize the new cluster's
+		// reads. Without the stamp, the window between PerformContextSwitch
+		// step 2 (client swap) and the post-switch invalidation is exploitable.
+		s.permCache = auth.NewPermissionCache().WithContextName(k8s.GetContextName)
 
 		if s.authConfig.Mode == "oidc" {
 			// Validate required OIDC fields before attempting provider discovery
@@ -176,6 +218,9 @@ func (s *Server) setupRoutes() {
 		r.Get("/auth/logout", s.handleLogout)
 	}
 
+	metricsHandler := s.newMetricsHandler()
+	r.Get("/metrics", metricsHandler.ServeHTTP)
+
 	// pprof routes for profiling. Not mounted under cloud-mode — they'd be
 	// reachable via the Cloud tunnel and leak the in-memory K8s cache (every
 	// Secret, ConfigMap, Pod spec) via /debug/pprof/heap. Local/standalone
@@ -224,6 +269,21 @@ func (s *Server) setupRoutes() {
 			r.Get("/cluster-info", s.handleClusterInfo)
 			r.Get("/capabilities", s.handleCapabilities)
 			r.Get("/topology", s.handleTopology)
+			r.Get("/gitops/tree/{kind}/{namespace}/{name}", s.handleGitOpsTree)
+			r.Get("/gitops/insights/{kind}/{namespace}/{name}", s.handleGitOpsInsights)
+			r.Get("/gitops/managed-resources", s.handleGitOpsManagedResources)
+
+			// RBAC reverse-lookup endpoints. Two shapes for /subject:
+			// ServiceAccount carries a namespace (3 segments after kind);
+			// User and Group are cluster-wide (2 segments). chi disambiguates
+			// by segment count. /role uses "_" as a sentinel for ClusterRole's
+			// empty namespace because chi requires a literal segment.
+			r.Get("/rbac/subject/{kind}/{namespace}/{name}", s.handleRBACSubject)
+			r.Get("/rbac/subject/{kind}/{name}", s.handleRBACSubject)
+			r.Get("/rbac/role/{kind}/{namespace}/{name}", s.handleRBACRole)
+			r.Get("/rbac/namespace/{namespace}", s.handleRBACNamespace)
+			r.Get("/rbac/whoami", s.handleRBACWhoami)
+
 			r.Get("/namespaces", s.handleNamespaces)
 			r.Get("/api-resources", s.handleAPIResources)
 			r.Get("/resource-counts", s.handleResourceCounts)
@@ -234,6 +294,7 @@ func (s *Server) setupRoutes() {
 			r.Get("/resources/{kind}/{namespace}/{name}/cascade-preview", s.handleCascadeDeletePreview)
 			r.Delete("/resources/{kind}/{namespace}/{name}", s.handleDeleteResource)
 			r.Get("/secrets/certificate-expiry", s.handleSecretCertExpiry)
+			r.Get("/certificates", s.handleCertificates)
 
 			// Cluster audit
 			r.Get("/audit", s.handleAudit)
@@ -243,6 +304,17 @@ func (s *Server) setupRoutes() {
 			// releases, workload labels, CRD registrations, and GitOps
 			// declarations. See pkg/packages for merge semantics.
 			r.Get("/packages", s.handleListPackages)
+
+			// Free-text resource search (name + namespace + labels +
+			// annotations + container images). Used by the hub fan-out
+			// for cross-cluster search; safe to call directly per-cluster.
+			r.Get("/search", s.handleSearch)
+
+			// Unified cluster-health endpoint — composes problems +
+			// audit findings + warning events + generic CRD condition
+			// fallback into one normalized list. Used by the hub
+			// fan-out for cross-cluster issues.
+			r.Get("/issues", s.handleIssues)
 			r.Get("/settings/audit", s.handleGetAuditSettings)
 			r.Put("/settings/audit", s.handlePutAuditSettings)
 			r.Get("/events", s.handleEvents)
@@ -273,6 +345,7 @@ func (s *Server) setupRoutes() {
 			r.Get("/metrics/nodes/{name}/history", s.handleNodeMetricsHistory)
 			r.Get("/metrics/top/pods", s.handleTopPods)
 			r.Get("/metrics/top/nodes", s.handleTopNodes)
+			r.Get("/metrics/top/resources", s.handleTopResources)
 
 			// Port forwarding
 			r.Get("/portforwards", s.handleListPortForwards)
@@ -306,7 +379,28 @@ func (s *Server) setupRoutes() {
 			imageHandlers := images.NewHandlers()
 			imageHandlers.RegisterRoutes(r)
 
-			// Prometheus metrics routes
+			// Prometheus metrics routes. The auth gate is required for endpoints
+			// that read K8s spec data via the shared informer cache (rightsizing,
+			// PVC usage) — the cache is populated under Radar's SA, so without
+			// it any authenticated user could fetch any namespace's spec.
+			//
+			// Two checks here, both load-bearing:
+			//   1. canRead (SAR) — does the user have RBAC for this verb on this
+			//      resource? Catches missing-RBAC.
+			//   2. getUserNamespaces — is the namespace in the user's discovered
+			//      allow-list? Matches handleGetResource semantics on the main
+			//      resource API. Without this, a user with cluster-wide SAR for
+			//      "get" could read derived data via these endpoints in namespaces
+			//      they're otherwise filtered out of (multi-tenant separation).
+			prometheuspkg.SetAuthGate(func(req *http.Request, group, resource, namespace, verb string) bool {
+				if !s.canRead(req, group, resource, namespace, verb) {
+					return false
+				}
+				if namespace != "" && noNamespaceAccess(s.getUserNamespaces(req, []string{namespace})) {
+					return false
+				}
+				return true
+			})
 			prometheuspkg.RegisterRoutes(r)
 
 			// OpenCost routes
@@ -321,13 +415,20 @@ func (s *Server) setupRoutes() {
 			// ArgoCD routes
 			r.Post("/argo/applications/{namespace}/{name}/sync", s.handleArgoSync)
 			r.Post("/argo/applications/{namespace}/{name}/refresh", s.handleArgoRefresh)
+			r.Post("/argo/applications/{namespace}/{name}/rollback", s.handleArgoRollback)
 			r.Post("/argo/applications/{namespace}/{name}/terminate", s.handleArgoTerminate)
 			r.Post("/argo/applications/{namespace}/{name}/suspend", s.handleArgoSuspend)
 			r.Post("/argo/applications/{namespace}/{name}/resume", s.handleArgoResume)
 
-			// AI resource preview (minified output for MCP/debugging)
-			r.Get("/ai/resources/{kind}", s.handleAIListResources)
-			r.Get("/ai/resources/{kind}/{namespace}/{name}", s.handleAIGetResource)
+			// AI resource preview (minified output for MCP/debugging).
+			// Mounted as a sub-group so agent-log middleware applies only
+			// to /api/ai/* — UI-facing /api/resources/* stays untouched.
+			r.Group(func(r chi.Router) {
+				r.Use(aiAgentLogMiddleware)
+				r.Get("/ai/resources/{kind}", s.handleAIListResources)
+				r.Get("/ai/resources/{kind}/{namespace}/{name}", s.handleAIGetResource)
+				r.Get("/ai/neighborhood/{kind}/{namespace}/{name}", s.handleAINeighborhood)
+			})
 
 			// Debug routes (for event pipeline diagnostics)
 			r.Get("/debug/events", s.handleDebugEvents)
@@ -348,6 +449,11 @@ func (s *Server) setupRoutes() {
 			// Context routes
 			r.Get("/contexts", s.handleListContexts)
 			r.Post("/contexts/{name}", s.handleSwitchContext)
+
+			// Active namespace switcher (k9s :ns equivalent for the
+			// namespace-scoped path; informational filter for cluster-wide users)
+			r.Get("/cluster/namespace-scope", s.handleGetNamespaceScope)
+			r.Post("/cluster/namespace", s.handleSetActiveNamespace)
 
 			// CAPI routes
 			r.Get("/capi/clusters/{ns}/{name}/kubeconfig", s.handleCAPIClusterKubeconfig)
@@ -390,10 +496,39 @@ func (s *Server) setupRoutes() {
 		r.Get("/traffic/flows/stream", s.handleTrafficFlowsStream)
 	})
 
+	// OAuth/OIDC discovery probes from MCP HTTP clients. Without these
+	// explicit 404s, two failure modes appear:
+	//   (a) the SPA fallback below answers root-level /.well-known/* with the
+	//       React index.html (HTTP 200, text/html);
+	//   (b) the /mcp Mount answers /mcp/.well-known/* with 405 because the
+	//       MCP handler only accepts POST.
+	// Both responses trigger claude-code's MCP transport (per upstream issue
+	// anthropics/claude-code#46879) to flip the server status to "needs-auth"
+	// — Claude Code probes /.well-known/oauth-{protected-resource,
+	// authorization-server} and /.well-known/openid-configuration before the
+	// MCP initialize and treats any non-404 as "this server is OAuth-
+	// protected." That leaks synthetic mcp__<server>__authenticate /
+	// complete_authentication tools into the model's tool catalog, which the
+	// agent then invents calls for. Per the MCP spec (RFC 9728 + RFC 8414),
+	// servers that do not implement OAuth should return 404 here so the
+	// client infers no auth is needed. Registered BEFORE the /mcp Mount so
+	// chi's radix tree resolves /mcp/.well-known/* to NotFound instead of
+	// letting the MCP handler answer with 405.
+	r.Handle("/.well-known/*", http.NotFoundHandler())
+	r.Handle("/mcp/.well-known/*", http.NotFoundHandler())
+
 	// MCP server (Model Context Protocol for AI tools)
 	if s.mcpHandler != nil {
 		r.Mount("/mcp", s.mcpHandler)
 	}
+
+	// OAuth discovery probes from MCP HTTP clients. Without this, the SPA
+	// catch-all answers /.well-known/oauth-* with HTML 200, which newer
+	// claude-code parses as a broken OAuth flow and aborts MCP registration.
+	// Radar's MCP server is unauthenticated when run locally; signal that
+	// cleanly with a 404 so clients proceed without an auth handshake.
+	r.Get("/.well-known/oauth-protected-resource", http.NotFound)
+	r.Get("/.well-known/oauth-authorization-server", http.NotFound)
 
 	// Static files (frontend) - SPA fallback to index.html
 	if s.staticFS != nil {
@@ -509,14 +644,13 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		status = "degraded"
 	}
 
-	// Get timeline store stats (informational only - doesn't affect overall status)
+	// Timeline store status is informational only and doesn't affect overall status.
 	var timelineStats map[string]any
 	if store := timeline.GetStore(); store != nil {
-		stats := store.Stats()
 		timelineStats = map[string]any{
-			"total_events": stats.TotalEvents,
-			"store_errors": timeline.GetStoreErrorCount(),
-			"total_drops":  timeline.GetTotalDropCount(),
+			"store_present": true,
+			"store_errors":  timeline.GetStoreErrorCount(),
+			"total_drops":   timeline.GetTotalDropCount(),
 		}
 	}
 
@@ -606,26 +740,26 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Include resource permissions if cache is available
-	if cache := k8s.GetResourceCache(); cache != nil {
-		enabled := cache.GetEnabledResources()
-		caps.Resources = &k8s.ResourcePermissions{
-			Pods:                     enabled["pods"],
-			Services:                 enabled["services"],
-			Deployments:              enabled["deployments"],
-			DaemonSets:               enabled["daemonsets"],
-			StatefulSets:             enabled["statefulsets"],
-			ReplicaSets:              enabled["replicasets"],
-			Ingresses:                enabled["ingresses"],
-			ConfigMaps:               enabled["configmaps"],
-			Secrets:                  enabled["secrets"],
-			Events:                   enabled["events"],
-			PersistentVolumeClaims:   enabled["persistentvolumeclaims"],
-			Nodes:                    enabled["nodes"],
-			Namespaces:               enabled["namespaces"],
-			Jobs:                     enabled["jobs"],
-			CronJobs:                 enabled["cronjobs"],
-			HorizontalPodAutoscalers: enabled["horizontalpodautoscalers"],
+	// Resource permissions come straight from the cached probe result, which
+	// populates every field of ResourcePermissions via field pointers in
+	// resourceProbeTargets(). Using GetEnabledResources() instead would
+	// silently drop fields that have no typed informer (the dynamic-cache
+	// CRDs surface via probe-result only). The probe-not-yet-run fallback
+	// kicks off a probe so the response isn't blank on startup.
+	//
+	// Intentionally NOT guarded by s.requireConnected — the frontend polls
+	// /api/capabilities to detect disconnect/loading state, so the endpoint
+	// must still respond when the cluster isn't connected. A nil
+	// caps.Resources (resources field omitted from JSON) is the documented
+	// "no probe data yet" signal; the frontend has separate connection
+	// state to distinguish loading from RBAC restrictions.
+	if result := k8s.GetCachedPermissionResult(); result != nil {
+		caps.Resources = result.Perms
+		caps.Visibility = k8s.BuildVisibilitySummary(result, r.URL.Query().Get("namespace"))
+	} else if k8s.GetResourceCache() != nil {
+		if result := k8s.CheckResourcePermissions(r.Context()); result != nil {
+			caps.Resources = result.Perms
+			caps.Visibility = k8s.BuildVisibilitySummary(result, r.URL.Query().Get("namespace"))
 		}
 	}
 
@@ -636,9 +770,33 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 // Returns nil for "all namespaces" (no filter), a populated slice for specific namespaces,
 // or an empty non-nil slice when the user has no namespace access.
 // Use noNamespaceAccess() to check the no-access case.
+//
+// If the request omits an explicit namespace filter, falls back to the user's
+// in-app namespace pick (from the namespace switcher). The pick is treated as
+// a view filter — it's still intersected with the user's RBAC-allowed
+// namespaces in getUserNamespaces.
 func (s *Server) parseNamespacesForUser(r *http.Request) []string {
 	namespaces := parseNamespaces(r.URL.Query())
-	return s.getUserNamespaces(r, namespaces)
+	pickFallback := false
+	if namespaces == nil {
+		// No explicit filter — use the user's saved picks if any.
+		s.loadSavedNamespacePreference(r)
+		if picks := s.getActiveNamespaceForUser(r); len(picks) > 0 {
+			namespaces = picks
+			pickFallback = true
+		}
+	}
+	filtered := s.getUserNamespaces(r, namespaces)
+	// If picks lost RBAC mid-session, the filter shrinks the set. When the
+	// intersection is empty every read returns []; recover by dropping the
+	// stale pick entirely and recomputing as if no filter were set, so the
+	// user sees their full RBAC ceiling instead of a silently-empty UI.
+	// Symmetric with handleGetNamespaceScope's partial-revocation eviction.
+	if pickFallback && noNamespaceAccess(filtered) {
+		s.setActiveNamespaceForUser(r, nil)
+		filtered = s.getUserNamespaces(r, nil)
+	}
+	return filtered
 }
 
 // noNamespaceAccess returns true when a namespace filter explicitly grants no access
@@ -646,6 +804,112 @@ func (s *Server) parseNamespacesForUser(r *http.Request) []string {
 // should check this and return empty results.
 func noNamespaceAccess(namespaces []string) bool {
 	return namespaces != nil && len(namespaces) == 0
+}
+
+// canRead authorizes a single (verb, group, resource, namespace) tuple for
+// the calling user via SubjectAccessReview. Used to gate cluster-scoped
+// reads — namespace-list discovery is too narrow a signal to authorize
+// arbitrary cluster-scoped kinds (a user can have cluster-wide pod
+// visibility without `list nodes`, `list secrets`, etc.).
+//
+// Returns true when:
+//
+//   - auth is disabled (no user on context — local kubeconfig case), OR
+//   - the apiserver's SAR for this exact tuple says yes
+//
+// Results are cached on UserPermissions and live only as long as the
+// surrounding namespace-discovery cache entry (2-min TTL by default), so
+// RBAC changes propagate within the TTL window.
+//
+// Pass namespace="" for a cluster-scoped check.
+func (s *Server) canRead(r *http.Request, group, resource, namespace, verb string) bool {
+	user := auth.UserFromContext(r.Context())
+	if user == nil || s.permCache == nil {
+		return true
+	}
+	perms := s.permCache.Get(user.Username)
+	if perms == nil {
+		// Trigger namespace discovery so SAR cache has a parent UserPermissions
+		// entry. parseNamespacesForUser is the canonical path that populates
+		// this; if it hasn't run yet, fall through to a fresh SAR every time.
+		_ = s.getUserNamespaces(r, []string{})
+		perms = s.permCache.Get(user.Username)
+	}
+	if perms != nil {
+		if v, ok := perms.CanI(verb, group, resource, namespace); ok {
+			return v
+		}
+	}
+	client := k8s.GetClient()
+	if client == nil {
+		// Fail-closed: no apiserver to ask, refuse rather than quietly
+		// serving from the cache.
+		log.Printf("[auth] canRead: K8s client unavailable, denying %s on %s/%s for %s", k8s.SanitizeForLog(verb), k8s.SanitizeForLog(group), k8s.SanitizeForLog(resource), k8s.SanitizeForLog(user.Username))
+		return false
+	}
+	allowed, err := auth.SubjectCanI(r.Context(), client, user.Username, user.Groups, namespace, group, resource, verb)
+	if err != nil {
+		// Fail-closed on SAR error — apiserver said something we don't trust.
+		log.Printf("[auth] canRead SAR failed for %s on %s/%s in ns=%q: %v", k8s.SanitizeForLog(user.Username), k8s.SanitizeForLog(group), k8s.SanitizeForLog(resource), k8s.SanitizeForLog(namespace), err)
+		return false
+	}
+	if perms != nil {
+		perms.SetCanI(verb, group, resource, namespace, allowed)
+	}
+	return allowed
+}
+
+// filterNamespacesByCanRead returns the subset of `namespaces` where the
+// calling user passes a per-namespace SAR for (group, resource, verb).
+// Fail-closed: SAR errors drop the namespace.
+//
+// Used to enforce per-kind RBAC inside a namespace when the cache reads as
+// the SA and the SA has broader permissions than individual users (the chart
+// can grant the SA cluster-wide secrets — any of rbac.secrets / rbac.helm /
+// auth.mode != "none" / cloud.enabled triggers it, for Helm release
+// visibility). Results memoize through UserPermissions.canI, so repeated
+// reads within the cache TTL don't re-SAR.
+//
+// nil or empty input is returned unchanged; the caller's namespace-access
+// gate (parseNamespacesForUser / noNamespaceAccess) is the upstream decision.
+func (s *Server) filterNamespacesByCanRead(r *http.Request, group, resource, verb string, namespaces []string) []string {
+	if len(namespaces) == 0 {
+		return namespaces
+	}
+	out := make([]string, 0, len(namespaces))
+	for _, ns := range namespaces {
+		if s.canRead(r, group, resource, ns, verb) {
+			out = append(out, ns)
+		}
+	}
+	return out
+}
+
+// deniedClusterScopedTopoKinds returns the set of cluster-scoped topology
+// NodeKinds the calling user cannot list. Walks topology.ClusterScopedKinds
+// (centralized table — see pkg/topology/cluster_scoped_kinds.go). Reuses
+// canRead's per-user canI cache so subsequent topology calls within the
+// TTL don't re-SAR.
+//
+// Skips CRDs not present in discovery (e.g. AKSNodeClass on an EKS cluster):
+// SARing a non-existent resource returns false because no RBAC rule covers
+// it, which would over-strip KindNodeClass for a user who has list-RBAC on
+// the provider that IS installed. Mirrors MCP canReadClusterScopedKind's
+// unknown-kind passthrough.
+func (s *Server) deniedClusterScopedTopoKinds(r *http.Request) map[topology.NodeKind]bool {
+	deny := make(map[topology.NodeKind]bool)
+	disc := k8s.GetResourceDiscovery()
+	for _, ck := range topology.ClusterScopedKinds {
+		if ck.Group != "" && disc != nil {
+			if _, ok := disc.GetResourceWithGroup(ck.Resource, ck.Group); !ok {
+				continue
+			}
+		}
+		if !s.canRead(r, ck.Group, ck.Resource, "", "list") {
+			deny[ck.Kind] = true
+		}
+	}
+	return deny
 }
 
 // parseNamespaces parses the namespace filter from query parameters.
@@ -706,7 +970,25 @@ func (s *Server) handleTopology(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.writeJSON(w, topo)
+	// Strip cluster-scoped resources (Nodes, Karpenter NodePool / NodeClaim,
+	// GatewayClass, PV, StorageClass, …) the user can't list. Topology pulls
+	// them from the SA-populated cache regardless of namespace scope, so
+	// without this strip a namespace-restricted user with cluster-wide pod
+	// access would enumerate cluster infrastructure they have no RBAC for.
+	if deny := s.deniedClusterScopedTopoKinds(r); len(deny) > 0 {
+		topo.StripNodeKinds(deny)
+	}
+
+	// Marshal once so we can record the exact wire size in perfstats.
+	// (writeJSON streams, which would force a counting-writer wrapper.)
+	data, err := json.Marshal(topo)
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	perfstats.RecordTopologyPayload(len(data))
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write(data)
 }
 
 func (s *Server) handleNamespaces(w http.ResponseWriter, r *http.Request) {
@@ -719,9 +1001,42 @@ func (s *Server) handleNamespaces(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Authoritative per-user filter from the discovery return value. Reading
+	// permCache.Get back after a transient discovery failure conflates
+	// "cluster-admin sentinel" with "cache miss" and would silently leak the
+	// full namespace list to a restricted user during apiserver flakes.
+	allowedNames := s.parseNamespacesForUser(r)
+	if allowedNames != nil && len(allowedNames) == 0 {
+		s.writeJSON(w, []map[string]any{})
+		return
+	}
+	var allowedSet map[string]bool
+	if allowedNames != nil {
+		allowedSet = make(map[string]bool, len(allowedNames))
+		for _, ns := range allowedNames {
+			allowedSet[ns] = true
+		}
+	}
+
 	lister := cache.Namespaces()
 	if lister == nil {
-		s.writeError(w, http.StatusForbidden, "insufficient permissions to list namespaces")
+		// Cluster-wide Namespaces informer isn't available — fall back to
+		// GetAccessibleNamespaces (SA-listed). Apply the same per-user
+		// filter so restricted users don't see SA-visible names they
+		// have no access to.
+		accessible, _ := k8s.GetAccessibleNamespaces(r.Context())
+		result := make([]map[string]any, 0, len(accessible))
+		for _, name := range accessible {
+			if allowedSet != nil && !allowedSet[name] {
+				continue
+			}
+			result = append(result, map[string]any{"name": name, "status": "Active"})
+		}
+		if len(result) == 0 {
+			s.writeError(w, http.StatusForbidden, "insufficient permissions to list namespaces")
+			return
+		}
+		s.writeJSON(w, result)
 		return
 	}
 
@@ -729,20 +1044,6 @@ func (s *Server) handleNamespaces(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, err.Error())
 		return
-	}
-
-	// Trigger namespace discovery for user (populates perm cache)
-	_ = s.parseNamespacesForUser(r)
-
-	// Filter namespace list using the resolved permissions
-	var allowedSet map[string]bool
-	if user := auth.UserFromContext(r.Context()); user != nil && s.permCache != nil {
-		if perms := s.permCache.Get(user.Username); perms != nil && perms.AllowedNamespaces != nil {
-			allowedSet = make(map[string]bool, len(perms.AllowedNamespaces))
-			for _, ns := range perms.AllowedNamespaces {
-				allowedSet[ns] = true
-			}
-		}
 	}
 
 	result := make([]map[string]any, 0, len(namespaces))
@@ -775,17 +1076,103 @@ func (s *Server) handleAPIResources(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, resources)
 }
 
+// preflightResourceList runs the per-user RBAC gates shared by the REST
+// (/api/resources/{kind}) and AI (/api/ai/resources/{kind}) list paths.
+// It assumes the caller has already populated `namespaces` via
+// parseNamespacesForUser (which primes the canI cache that canRead relies on)
+// and has classified the kind for cluster-scope.
+//
+// Returns the (possibly-rewritten) namespace slice that downstream cache
+// reads should use. When ok=false the gate denied or the user has no
+// namespace access; (status, msg) carry the canonical HTTP response. REST
+// callers historically convert denies to a 200 with `[]` to avoid leaking
+// kind existence; the AI path returns the explicit status so agents see the
+// failure. Same gates run in the same order on both paths — the response
+// shape is the only thing that differs.
+func (s *Server) preflightResourceList(r *http.Request, kind, group string, namespaces []string) (finalNamespaces []string, status int, msg string, ok bool) {
+	// "namespaces" is cluster-scoped at the K8s API. Full Namespace objects
+	// (labels, annotations, spec) require explicit list-namespaces SAR.
+	// AllowedNamespaces is NOT a sufficient fallback: list-pods-in-alpha
+	// SAR-confirms namespace existence and pod read access, not get-namespace-
+	// alpha (which would require ClusterRole on namespaces). The namespace
+	// picker uses /api/namespaces, which serves a synthesized {name, status}
+	// view filtered by AllowedNamespaces — restricted users keep their picker
+	// without leaking Namespace metadata via this resource-browser path.
+	isNamespacesKind := kind == "namespaces" || kind == "namespace"
+	if isNamespacesKind {
+		if !s.canRead(r, "", "namespaces", "", "list") {
+			return nil, http.StatusForbidden, "insufficient permissions to list namespaces", false
+		}
+		return nil, 0, "", true // full lister output for SAR-authorized users
+	}
+
+	// Cluster-only kinds (Nodes, PVs, StorageClasses, ClusterRoles, cluster-
+	// scoped CRDs) have no namespace dimension — gate via SAR. Run BEFORE the
+	// noNamespaceAccess check so a user with explicit cluster-scoped RBAC but
+	// no namespace access can still read those resources.
+	isClusterScoped, gvrGroup, gvrResource := k8s.ClassifyKindScope(kind, group)
+	if isClusterScoped {
+		if !s.canRead(r, gvrGroup, gvrResource, "", "list") {
+			return nil, http.StatusForbidden, fmt.Sprintf("insufficient permissions to list %s", kind), false
+		}
+		// Cluster-scoped reads have no namespace dimension. Once the
+		// resource-level SAR passes, force the later typed/dynamic cache paths
+		// through their cluster-wide branch even if the user also has a
+		// namespace view preference.
+		return nil, 0, "", true
+	}
+
+	if noNamespaceAccess(namespaces) {
+		return namespaces, http.StatusForbidden, "no namespace access", false
+	}
+
+	// Per-kind RBAC inside a namespace. Helm release storage IS K8s Secrets,
+	// so the chart can grant the SA cluster-wide secrets (rbac.secrets,
+	// rbac.helm, auth.mode != "none", or cloud.enabled — see deploy/helm/
+	// radar/templates/clusterrole.yaml). When any of those triggers fires
+	// the cache holds every secret in the cluster, so per-user RBAC must
+	// gate the read. Other namespaced kinds are deferred.
+	if kind == "secrets" || kind == "secret" {
+		if auth.UserFromContext(r.Context()) != nil {
+			if namespaces == nil {
+				// Auth user with cluster-wide namespace access (e.g. picked up
+				// via DiscoverNamespaces stage 1: cluster-wide list pods). The
+				// cache will serve all secrets — gate on cluster-scope SAR.
+				if !s.canRead(r, "", "secrets", "", "list") {
+					return nil, http.StatusForbidden, "insufficient permissions to list secrets", false
+				}
+			} else {
+				namespaces = s.filterNamespacesByCanRead(r, "", "secrets", "list", namespaces)
+				if len(namespaces) == 0 {
+					return namespaces, http.StatusForbidden, "insufficient permissions to list secrets", false
+				}
+			}
+		}
+	}
+
+	return namespaces, 0, "", true
+}
+
 func (s *Server) handleListResources(w http.ResponseWriter, r *http.Request) {
 	if !s.requireConnected(w) {
 		return
 	}
 	kind := normalizeKind(chi.URLParam(r, "kind"))
+	group := r.URL.Query().Get("group") // API group for CRD disambiguation
+
+	// parseNamespacesForUser primes the per-user perm cache (triggers
+	// DiscoverNamespaces if needed). canRead below relies on it.
 	namespaces := s.parseNamespacesForUser(r)
-	if noNamespaceAccess(namespaces) {
+
+	// Shared RBAC gate. REST converts denies to 200 with `[]` (legacy shape
+	// the SPA tolerates and that doesn't leak kind existence); the AI path
+	// returns the explicit status.
+	finalNamespaces, _, _, ok := s.preflightResourceList(r, kind, group, namespaces)
+	if !ok {
 		s.writeJSON(w, []any{})
 		return
 	}
-	group := r.URL.Query().Get("group") // API group for CRD disambiguation
+	namespaces = finalNamespaces
 
 	cache := k8s.GetResourceCache()
 	if cache == nil {
@@ -832,10 +1219,14 @@ func (s *Server) handleListResources(w http.ResponseWriter, r *http.Request) {
 		forbiddenMsg(resourceKind)
 	}
 
-	// When a group is specified, skip the typed cache and use the dynamic cache
-	// directly. This handles CRDs whose plural name collides with core resources
-	// (e.g., KNative "services" vs core "services").
-	if group != "" {
+	// A non-empty group routes to the dynamic/CRD cache so CRDs whose plural
+	// collides with a core kind (e.g. KNative "services" vs core "services")
+	// reach the right resource. Built-in workloads addressed by their real group
+	// (e.g. deployments?group=apps) live in the typed cache, so they must fall
+	// through to the typed switch below — TypedKindOwnsGroup keeps them off the
+	// dynamic path (which has no informer for built-ins). Cluster-scoped gating
+	// is already done at the top of this handler via k8s.ClassifyKindScope.
+	if group != "" && !k8s.TypedKindOwnsGroup(kind, group) {
 		if len(namespaces) > 0 {
 			var merged []any
 			for _, ns := range namespaces {
@@ -843,6 +1234,10 @@ func (s *Server) handleListResources(w http.ResponseWriter, r *http.Request) {
 				if listErr != nil {
 					if strings.Contains(listErr.Error(), "unknown resource kind") {
 						s.writeError(w, http.StatusBadRequest, listErr.Error())
+						return
+					}
+					if apierrors.IsForbidden(listErr) || apierrors.IsUnauthorized(listErr) {
+						forbiddenMsg(kind)
 						return
 					}
 					log.Printf("[resources] Failed to list %s in namespace %s (group=%s): %v", kind, ns, group, listErr)
@@ -859,6 +1254,10 @@ func (s *Server) handleListResources(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				if strings.Contains(err.Error(), "unknown resource kind") {
 					s.writeError(w, http.StatusBadRequest, err.Error())
+					return
+				}
+				if apierrors.IsForbidden(err) || apierrors.IsUnauthorized(err) {
+					forbiddenMsg(kind)
 					return
 				}
 				log.Printf("[resources] Failed to list %s (group=%s): %v", kind, group, err)
@@ -977,6 +1376,36 @@ func (s *Server) handleListResources(w http.ResponseWriter, r *http.Request) {
 				return cache.PersistentVolumeClaims().PersistentVolumeClaims(ns).List(labels.Everything())
 			},
 		)
+	case "roles":
+		if cache.Roles() == nil {
+			forbiddenMsg("roles")
+			return
+		}
+		result, err = listPerNs(
+			func() (any, error) { return cache.Roles().List(labels.Everything()) },
+			func(ns string) (any, error) { return cache.Roles().Roles(ns).List(labels.Everything()) },
+		)
+	case "clusterroles":
+		if cache.ClusterRoles() == nil {
+			forbiddenMsg("clusterroles")
+			return
+		}
+		result, err = cache.ClusterRoles().List(labels.Everything())
+	case "rolebindings":
+		if cache.RoleBindings() == nil {
+			forbiddenMsg("rolebindings")
+			return
+		}
+		result, err = listPerNs(
+			func() (any, error) { return cache.RoleBindings().List(labels.Everything()) },
+			func(ns string) (any, error) { return cache.RoleBindings().RoleBindings(ns).List(labels.Everything()) },
+		)
+	case "clusterrolebindings":
+		if cache.ClusterRoleBindings() == nil {
+			forbiddenMsg("clusterrolebindings")
+			return
+		}
+		result, err = cache.ClusterRoleBindings().List(labels.Everything())
 	case "jobs":
 		if cache.Jobs() == nil {
 			forbiddenMsg("jobs")
@@ -1018,6 +1447,8 @@ func (s *Server) handleListResources(w http.ResponseWriter, r *http.Request) {
 			forbiddenMsg("namespaces")
 			return
 		}
+		// SAR gate above already filtered: cluster-admin / no-auth fell
+		// through with namespaces=nil; restricted users early-returned [].
 		result, err = cache.Namespaces().List(labels.Everything())
 	case "persistentvolumes", "pvs":
 		if cache.PersistentVolumes() == nil {
@@ -1040,6 +1471,51 @@ func (s *Server) handleListResources(w http.ResponseWriter, r *http.Request) {
 			func() (any, error) { return cache.PodDisruptionBudgets().List(labels.Everything()) },
 			func(ns string) (any, error) {
 				return cache.PodDisruptionBudgets().PodDisruptionBudgets(ns).List(labels.Everything())
+			},
+		)
+	case "serviceaccounts":
+		// ServiceAccounts are in the deferred informer batch, but the typed
+		// lister object is available before sync (isEnabled is true). Calling
+		// .List() pre-sync would return empty, which the frontend renders as
+		// "No ServiceAccount found" — misleading when 46 actually exist.
+		// notReadyOrForbidden distinguishes "still syncing" (503) from
+		// "RBAC denied" (403).
+		if cache.ServiceAccounts() == nil {
+			notReadyOrForbidden("serviceaccounts")
+			return
+		}
+		result, err = listPerNs(
+			func() (any, error) { return cache.ServiceAccounts().List(labels.Everything()) },
+			func(ns string) (any, error) {
+				return cache.ServiceAccounts().ServiceAccounts(ns).List(labels.Everything())
+			},
+		)
+	case "ingressclasses":
+		if cache.IngressClasses() == nil {
+			forbiddenMsg("ingressclasses")
+			return
+		}
+		result, err = cache.IngressClasses().List(labels.Everything())
+	case "limitranges":
+		if cache.LimitRanges() == nil {
+			notReadyOrForbidden("limitranges")
+			return
+		}
+		result, err = listPerNs(
+			func() (any, error) { return cache.LimitRanges().List(labels.Everything()) },
+			func(ns string) (any, error) {
+				return cache.LimitRanges().LimitRanges(ns).List(labels.Everything())
+			},
+		)
+	case "resourcequotas":
+		if cache.ResourceQuotas() == nil {
+			notReadyOrForbidden("resourcequotas")
+			return
+		}
+		result, err = listPerNs(
+			func() (any, error) { return cache.ResourceQuotas().List(labels.Everything()) },
+			func(ns string) (any, error) {
+				return cache.ResourceQuotas().ResourceQuotas(ns).List(labels.Everything())
 			},
 		)
 	case "networkpolicies", "netpol":
@@ -1106,6 +1582,55 @@ func setTypeMeta(resource any) {
 	k8s.SetTypeMeta(resource)
 }
 
+// preflightResourceGet runs the per-user RBAC gates that must pass before any
+// single-resource GET fetch. Mirrors the kind/scope-aware logic used by both
+// the REST handler (handleGetResource) and the AI handler (handleAIGetResource)
+// so future RBAC adjustments stay in lockstep across both surfaces.
+//
+// Inputs are the already-normalized (kind, namespace, name, group); callers
+// must collapse the cluster-scoped "_" placeholder before calling. Returns
+// (status, message, ok=true) when the request passes the gates, or
+// (status, message, ok=false) with the HTTP status + body the caller should
+// emit on deny.
+//
+// Three gates, run in this order:
+//  1. kind == "namespaces"        → full Namespace object requires get-namespaces SAR
+//  2. cluster-scoped (Node/CRD/…) → per-kind get SAR (ClassifyKindScope)
+//  3. namespaced                   → namespace access via getUserNamespaces,
+//     plus per-namespace get SAR for Secrets
+func (s *Server) preflightResourceGet(r *http.Request, kind, namespace, name, group string) (int, string, bool) {
+	isNamespacesKind := kind == "namespaces" || kind == "namespace"
+	isClusterScoped, gvrGroup, gvrResource := k8s.ClassifyKindScope(kind, group)
+	switch {
+	case isNamespacesKind:
+		// Full Namespace object access requires explicit get-namespaces SAR.
+		// Read access to resources IN a namespace (list pods etc.) does not
+		// imply read access to the Namespace object itself. Restricted users
+		// without ClusterRole on namespaces get 403 here.
+		if !s.canRead(r, "", "namespaces", "", "get") {
+			return http.StatusForbidden, fmt.Sprintf("no access to namespace %q", name), false
+		}
+	case isClusterScoped:
+		if !s.canRead(r, gvrGroup, gvrResource, "", "get") {
+			return http.StatusForbidden, fmt.Sprintf("no access to %s (cluster-scoped resource requires explicit RBAC)", kind), false
+		}
+	case namespace != "":
+		// Namespaced kind: verify namespace access.
+		allowed := s.getUserNamespaces(r, []string{namespace})
+		if noNamespaceAccess(allowed) {
+			return http.StatusForbidden, fmt.Sprintf("no access to namespace %q", namespace), false
+		}
+		// Per-kind RBAC inside the namespace for Secrets — the chart can
+		// grant the SA cluster-wide secrets (Helm release visibility), so
+		// namespace-list discovery is not a sufficient gate here. The list
+		// handler has the matching list-SAR.
+		if (kind == "secrets" || kind == "secret") && !s.canRead(r, "", "secrets", namespace, "get") {
+			return http.StatusForbidden, fmt.Sprintf("no access to secrets in namespace %q", namespace), false
+		}
+	}
+	return 0, "", true
+}
+
 func (s *Server) handleGetResource(w http.ResponseWriter, r *http.Request) {
 	if !s.requireConnected(w) {
 		return
@@ -1120,13 +1645,18 @@ func (s *Server) handleGetResource(w http.ResponseWriter, r *http.Request) {
 		namespace = ""
 	}
 
-	// Check namespace access for namespaced resources
-	if namespace != "" {
-		allowed := s.getUserNamespaces(r, []string{namespace})
-		if noNamespaceAccess(allowed) {
-			s.writeError(w, http.StatusForbidden, fmt.Sprintf("no access to namespace %q", namespace))
-			return
-		}
+	// Cluster-scoped GETs (Node, ClusterRole, cluster-scoped CRDs, …) are
+	// gated per-kind via SAR. Run BEFORE the namespace access check so
+	// users with explicit cluster-scoped RBAC but no namespace access can
+	// still get the resource. ClassifyKindScope catches both static cluster-
+	// only kinds and dynamic cluster-scoped CRDs (via discovery).
+	//
+	// "namespaces" is cluster-scoped at the K8s API but exposed as a per-user
+	// filtered list — gate the GET via the user's namespace access for the
+	// requested name, not via cluster-scoped SAR.
+	if status, msg, ok := s.preflightResourceGet(r, kind, namespace, name, group); !ok {
+		s.writeError(w, status, msg)
+		return
 	}
 
 	cache := k8s.GetResourceCache()
@@ -1152,10 +1682,16 @@ func (s *Server) handleGetResource(w http.ResponseWriter, r *http.Request) {
 		forbiddenGet(resourceKind)
 	}
 
-	// When a group is specified, skip the typed cache and use the dynamic cache
-	// directly. This handles CRDs whose plural name collides with core resources
-	// (e.g., KNative "services" vs core "services").
-	if group != "" {
+	// A non-empty group routes to the dynamic/CRD cache so CRDs whose plural
+	// collides with a core kind (e.g. KNative serving.knative.dev/services vs
+	// core "services") reach the right resource. But the SPA also threads the
+	// real apiGroup for BUILT-IN workloads (e.g. apps/Deployment), and those
+	// live in the typed cache, not the dynamic one — so a built-in addressed by
+	// its own group must still take the typed path below. Without this guard,
+	// deployments?group=apps fell through to the dynamic cache and 400'd with
+	// "unknown resource kind: deployments (group: apps)". Cluster-scoped gating
+	// is already done at the top of this handler via k8s.ClassifyKindScope.
+	if group != "" && !k8s.TypedKindOwnsGroup(kind, group) {
 		resource, err = cache.GetDynamicWithGroup(r.Context(), kind, namespace, name, group)
 		if err != nil {
 			if strings.Contains(err.Error(), "unknown resource kind") {
@@ -1172,12 +1708,14 @@ func (s *Server) handleGetResource(w http.ResponseWriter, r *http.Request) {
 		}
 		setTypeMeta(resource)
 
-		// Get relationships from cached topology
+		// Get relationships from cached topology. Pass the already-fetched
+		// resource so ManagedBy synthesis disambiguates by group (avoids
+		// kind/plural collisions like Knative Service vs core Service).
 		var relationships *topology.Relationships
 		if cachedTopo := s.broadcaster.GetCachedTopology(); cachedTopo != nil {
-			relationships = topology.GetRelationships(kind, namespace, name, cachedTopo,
+			relationships = topology.GetRelationshipsWithObject(kind, namespace, name, resource, cachedTopo,
 				k8s.NewTopologyResourceProvider(k8s.GetResourceCache()),
-				k8s.NewTopologyDynamicProvider(k8s.GetDynamicResourceCache(), k8s.GetResourceDiscovery()))
+				k8s.NewTopologyDynamicProvider(k8s.GetDynamicResourceCache(), k8s.GetResourceDiscovery()), nil)
 		}
 
 		s.writeJSON(w, topology.ResourceWithRelationships{
@@ -1310,6 +1848,54 @@ func (s *Server) handleGetResource(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		resource, err = cache.NetworkPolicies().NetworkPolicies(namespace).Get(name)
+	case "serviceaccounts", "serviceaccount":
+		if cache.ServiceAccounts() == nil {
+			notReadyOrForbiddenGet("serviceaccounts")
+			return
+		}
+		resource, err = cache.ServiceAccounts().ServiceAccounts(namespace).Get(name)
+	case "ingressclasses", "ingressclass":
+		if cache.IngressClasses() == nil {
+			forbiddenGet("ingressclasses")
+			return
+		}
+		resource, err = cache.IngressClasses().Get(name)
+	case "limitranges", "limitrange":
+		if cache.LimitRanges() == nil {
+			notReadyOrForbiddenGet("limitranges")
+			return
+		}
+		resource, err = cache.LimitRanges().LimitRanges(namespace).Get(name)
+	case "resourcequotas", "resourcequota":
+		if cache.ResourceQuotas() == nil {
+			notReadyOrForbiddenGet("resourcequotas")
+			return
+		}
+		resource, err = cache.ResourceQuotas().ResourceQuotas(namespace).Get(name)
+	case "roles", "role":
+		if cache.Roles() == nil {
+			forbiddenGet("roles")
+			return
+		}
+		resource, err = cache.Roles().Roles(namespace).Get(name)
+	case "clusterroles", "clusterrole":
+		if cache.ClusterRoles() == nil {
+			forbiddenGet("clusterroles")
+			return
+		}
+		resource, err = cache.ClusterRoles().Get(name)
+	case "rolebindings", "rolebinding":
+		if cache.RoleBindings() == nil {
+			forbiddenGet("rolebindings")
+			return
+		}
+		resource, err = cache.RoleBindings().RoleBindings(namespace).Get(name)
+	case "clusterrolebindings", "clusterrolebinding":
+		if cache.ClusterRoleBindings() == nil {
+			forbiddenGet("clusterrolebindings")
+			return
+		}
+		resource, err = cache.ClusterRoleBindings().Get(name)
 	default:
 		// Fall back to dynamic cache for CRDs and other unknown resources
 		// Use group to disambiguate when multiple API groups have similar resource names
@@ -1336,12 +1922,14 @@ func (s *Server) handleGetResource(w http.ResponseWriter, r *http.Request) {
 	// Set APIVersion and Kind for typed resources (informers don't populate these)
 	setTypeMeta(resource)
 
-	// Get relationships from cached topology
+	// Get relationships from cached topology. Pass the already-fetched
+	// resource so ManagedBy synthesis uses the authoritative object instead
+	// of a group-blind kind/name lookup.
 	var relationships *topology.Relationships
 	if cachedTopo := s.broadcaster.GetCachedTopology(); cachedTopo != nil {
-		relationships = topology.GetRelationships(kind, namespace, name, cachedTopo,
+		relationships = topology.GetRelationshipsWithObject(kind, namespace, name, resource, cachedTopo,
 			k8s.NewTopologyResourceProvider(k8s.GetResourceCache()),
-			k8s.NewTopologyDynamicProvider(k8s.GetDynamicResourceCache(), k8s.GetResourceDiscovery()))
+			k8s.NewTopologyDynamicProvider(k8s.GetDynamicResourceCache(), k8s.GetResourceDiscovery()), nil)
 	}
 
 	// Return resource with relationships
@@ -1384,6 +1972,10 @@ func (s *Server) handlePodMetrics(w http.ResponseWriter, r *http.Request) {
 // handleNodeMetrics fetches metrics for a specific node from the metrics.k8s.io API
 func (s *Server) handleNodeMetrics(w http.ResponseWriter, r *http.Request) {
 	name := chi.URLParam(r, "name")
+	if !s.canRead(r, "", "nodes", "", "get") {
+		s.writeError(w, http.StatusForbidden, "no access to nodes (cluster-scoped resource requires explicit RBAC)")
+		return
+	}
 
 	metrics, err := k8s.GetNodeMetrics(r.Context(), name)
 	if err != nil {
@@ -1429,6 +2021,10 @@ func (s *Server) handlePodMetricsHistory(w http.ResponseWriter, r *http.Request)
 // handleNodeMetricsHistory returns historical metrics for a specific node
 func (s *Server) handleNodeMetricsHistory(w http.ResponseWriter, r *http.Request) {
 	name := chi.URLParam(r, "name")
+	if !s.canRead(r, "", "nodes", "", "get") {
+		s.writeError(w, http.StatusForbidden, "no access to nodes (cluster-scoped resource requires explicit RBAC)")
+		return
+	}
 
 	store := k8s.GetMetricsHistory()
 	if store == nil {
@@ -1526,6 +2122,10 @@ func (s *Server) handleTopNodes(w http.ResponseWriter, r *http.Request) {
 	if !s.requireConnected(w) {
 		return
 	}
+	if !s.canRead(r, "", "nodes", "", "list") {
+		s.writeJSON(w, []k8s.TopNodeMetrics{})
+		return
+	}
 
 	// Build metrics lookup (may be empty if metrics-server is unavailable)
 	metricsMap := make(map[string]*k8s.TopNodeMetrics)
@@ -1594,6 +2194,80 @@ func (s *Server) handleTopNodes(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.writeJSON(w, result)
+}
+
+// handleTopResources returns ranked live metrics for agents and compact
+// diagnostics. It is intentionally separate from /metrics/top/{pods,nodes},
+// which back UI tables and preserve their unsorted array shape.
+func (s *Server) handleTopResources(w http.ResponseWriter, r *http.Request) {
+	if !s.requireConnected(w) {
+		return
+	}
+	q := r.URL.Query()
+	kind := q.Get("kind")
+	if kind == "" {
+		kind = k8s.TopMetricsKindPods
+	}
+	opts := k8s.NormalizeTopMetricsOptions(k8s.TopMetricsOptions{
+		Kind:      kind,
+		Namespace: q.Get("namespace"),
+		Sort:      q.Get("sort"),
+		Limit:     parseLimit(q.Get("limit")),
+	})
+
+	if opts.Kind == k8s.TopMetricsKindNodes {
+		if !s.canRead(r, "", "nodes", "", "list") {
+			s.writeJSON(w, k8s.TopMetricsResponse{
+				Kind:   opts.Kind,
+				Sort:   opts.Sort,
+				Reason: "no access to nodes (cluster-scoped resource requires explicit RBAC)",
+			})
+			return
+		}
+		s.writeJSON(w, k8s.BuildTopMetrics(opts))
+		return
+	}
+
+	namespaces := s.parseNamespacesForUser(r)
+	if opts.Namespace != "" {
+		if !namespaceAllowed(namespaces, opts.Namespace) {
+			s.writeJSON(w, k8s.TopMetricsResponse{
+				Kind:      opts.Kind,
+				Sort:      opts.Sort,
+				Namespace: opts.Namespace,
+				Reason:    "no access to namespace",
+			})
+			return
+		}
+		s.writeJSON(w, k8s.BuildTopMetrics(opts))
+		return
+	}
+	if noNamespaceAccess(namespaces) {
+		s.writeJSON(w, k8s.TopMetricsResponse{Kind: opts.Kind, Sort: opts.Sort, Reason: "no namespace access"})
+		return
+	}
+	if namespaces == nil {
+		s.writeJSON(w, k8s.BuildTopMetrics(opts))
+		return
+	}
+	if len(namespaces) == 1 {
+		opts.Namespace = namespaces[0]
+		s.writeJSON(w, k8s.BuildTopMetrics(opts))
+		return
+	}
+	s.writeError(w, http.StatusBadRequest, "namespace is required when access is limited to multiple namespaces")
+}
+
+func namespaceAllowed(namespaces []string, namespace string) bool {
+	if namespaces == nil {
+		return true
+	}
+	for _, ns := range namespaces {
+		if ns == namespace {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
@@ -2321,12 +2995,6 @@ func (s *Server) handleSwitchContext(w http.ResponseWriter, r *http.Request) {
 	// Stop all active sessions before switching
 	StopAllSessions()
 
-	// Invalidate per-user permission cache (different cluster = different RBAC)
-	if s.permCache != nil {
-		s.permCache.Invalidate()
-	}
-
-	// Perform the context switch
 	if err := k8s.PerformContextSwitch(name); err != nil {
 		k8s.SetConnectionStatus(k8s.ConnectionStatus{
 			State:     k8s.StateDisconnected,
@@ -2338,7 +3006,9 @@ func (s *Server) handleSwitchContext(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Set connected state after successful switch
+	// Per-user state (permCache, namespace picks, capabilities cache) is
+	// cleared by the OnContextSwitch callback registered in New().
+
 	k8s.SetConnectionStatus(k8s.ConnectionStatus{
 		State:       k8s.StateConnected,
 		Context:     k8s.GetContextName(),
@@ -2536,13 +3206,8 @@ func (s *Server) handleCAPIClusterConnect(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Stop active sessions before switching
 	StopAllSessions()
-	if s.permCache != nil {
-		s.permCache.Invalidate()
-	}
 
-	// Switch to the new context
 	if err := k8s.PerformContextSwitch(qualifiedName); err != nil {
 		k8s.SetConnectionStatus(k8s.ConnectionStatus{
 			State:     k8s.StateDisconnected,
@@ -2553,6 +3218,8 @@ func (s *Server) handleCAPIClusterConnect(w http.ResponseWriter, r *http.Request
 		s.writeError(w, http.StatusInternalServerError, "failed to switch context: "+err.Error())
 		return
 	}
+
+	// Per-user state cleared via the OnContextSwitch callback (see New()).
 
 	k8s.SetConnectionStatus(k8s.ConnectionStatus{
 		State:       k8s.StateConnected,
@@ -2639,7 +3306,7 @@ func (s *Server) getDynamicClientForRequest(r *http.Request) dynamic.Interface {
 	if user := auth.UserFromContext(r.Context()); user != nil {
 		client, err := k8s.ImpersonatedDynamicClient(user.Username, user.Groups)
 		if err != nil {
-			log.Printf("[auth] Impersonation failed for %s: %v", user.Username, err)
+			log.Printf("[auth] Impersonation failed for %s: %v", k8s.SanitizeForLog(user.Username), err)
 			return nil
 		}
 		return client
@@ -2654,7 +3321,7 @@ func (s *Server) getConfigForRequest(r *http.Request) *rest.Config {
 	if user := auth.UserFromContext(r.Context()); user != nil {
 		cfg, err := k8s.ImpersonatedConfig(user.Username, user.Groups)
 		if err != nil {
-			log.Printf("[auth] Impersonation failed for %s: %v", user.Username, err)
+			log.Printf("[auth] Impersonation failed for %s: %v", k8s.SanitizeForLog(user.Username), err)
 			return nil
 		}
 		return cfg
@@ -2669,7 +3336,7 @@ func (s *Server) getClientForRequest(r *http.Request) kubernetes.Interface {
 	if user := auth.UserFromContext(r.Context()); user != nil {
 		client, err := k8s.ImpersonatedClient(user.Username, user.Groups)
 		if err != nil {
-			log.Printf("[auth] Impersonation failed for %s: %v", user.Username, err)
+			log.Printf("[auth] Impersonation failed for %s: %v", k8s.SanitizeForLog(user.Username), err)
 			return nil
 		}
 		return client
@@ -2702,7 +3369,7 @@ func (s *Server) getUserNamespaces(r *http.Request, requested []string) []string
 		// Discover namespaces synchronously on first request
 		client := k8s.GetClient()
 		if client == nil {
-			log.Printf("[auth] K8s client not available for namespace discovery (user=%s) — denying access", user.Username)
+			log.Printf("[auth] K8s client not available for namespace discovery (user=%s) — denying access", k8s.SanitizeForLog(user.Username))
 			return []string{} // fail-closed: cannot verify permissions
 		}
 
@@ -2716,10 +3383,21 @@ func (s *Server) getUserNamespaces(r *http.Request, requested []string) []string
 				}
 			}
 		}
+		// Fallback for namespace-scoped SAs: when the cluster-wide namespace
+		// informer is unavailable (SA lacks list-namespaces RBAC), the lister
+		// is empty and DiscoverNamespaces' per-namespace SAR loop has nothing
+		// to iterate — every non-admin user gets [] even when they have RBAC
+		// on the SA's bound namespace. Seed candidates from the kubeconfig
+		// context / --namespace fallback so those users get surfaced.
+		if len(allNamespaces) == 0 {
+			if accessible, _ := k8s.GetAccessibleNamespaces(r.Context()); len(accessible) > 0 {
+				allNamespaces = accessible
+			}
+		}
 
 		allowed, err := auth.DiscoverNamespaces(r.Context(), client, user.Username, user.Groups, allNamespaces)
 		if err != nil {
-			log.Printf("[auth] Failed to discover namespaces for %s: %v — denying access (fail-closed)", user.Username, err)
+			log.Printf("[auth] Failed to discover namespaces for %s: %v — denying access (fail-closed)", k8s.SanitizeForLog(user.Username), err)
 			return []string{} // fail-closed: no access on discovery error
 		}
 
@@ -2733,8 +3411,17 @@ func (s *Server) getUserNamespaces(r *http.Request, requested []string) []string
 
 // handleSSE wraps the SSEBroadcaster's HandleSSE with per-user namespace filtering.
 func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
-	// Apply user namespace filtering to SSE subscriptions
-	namespaces := s.parseNamespacesForUser(r)
+	// SSE is usually opened without an explicit namespace filter so the
+	// frontend can keep one all-namespace stream and filter topology/events
+	// locally. Do not fall back to the saved namespace picker here; only
+	// server-filter when the request explicitly asks for it (large-cluster
+	// mode), while still intersecting with RBAC for authenticated users.
+	namespaces := parseNamespaces(r.URL.Query())
+	if namespaces == nil {
+		namespaces = s.getUserNamespaces(r, nil)
+	} else {
+		namespaces = s.getUserNamespaces(r, namespaces)
+	}
 	// Re-encode filtered namespaces back into query params for the broadcaster
 	q := r.URL.Query()
 	q.Del("namespace")
@@ -2837,31 +3524,44 @@ type configResponse struct {
 }
 
 // handleGetConfig returns the on-disk config file alongside the effective startup config.
+// PrometheusHeaders are redacted — they may contain Bearer tokens / tenant IDs and the
+// diagnostics endpoint already masks them as a presence bool.
 func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
+	file := config.Load()
+	file.PrometheusHeaders = nil
 	resp := configResponse{
-		File:      config.Load(),
+		File:      file,
 		IsDesktop: version.IsDesktop(),
 	}
 	if s.effectiveConfig != nil {
-		resp.Effective = *s.effectiveConfig
+		effective := *s.effectiveConfig
+		effective.PrometheusHeaders = nil
+		resp.Effective = effective
 	}
 	s.writeJSON(w, resp)
 }
 
 // handlePutConfig replaces the entire config file. Changes take effect on next restart.
 // Unlike handlePutSettings (which merges fields), this is a full replacement.
+// PrometheusHeaders are preserved from the on-disk file: the GET response redacts them,
+// so a UI round-trip would otherwise silently wipe the user's auth headers.
 func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 	var updated config.Config
 	if err := json.NewDecoder(r.Body).Decode(&updated); err != nil {
 		s.writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	result, err := config.Update(func(c *config.Config) { *c = updated })
+	result, err := config.Update(func(c *config.Config) {
+		preserved := c.PrometheusHeaders
+		*c = updated
+		c.PrometheusHeaders = preserved
+	})
 	if err != nil {
 		log.Printf("[config] Failed to save config: %v", err)
 		s.writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	result.PrometheusHeaders = nil
 	s.writeJSON(w, result)
 }
 

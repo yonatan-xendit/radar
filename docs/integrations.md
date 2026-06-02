@@ -59,7 +59,7 @@ Radar automatically discovers and displays **any** Custom Resource Definition (C
 | NodeClaim | `karpenter.sh/v1` | Yes | Yes | Yes |
 | EC2NodeClass | `karpenter.k8s.aws/v1` | Yes | Yes | Yes |
 | AKSNodeClass | `karpenter.azure.com/v1alpha2` | Yes | Generic | Yes |
-| GCPNodeClass | `karpenter.gcp.compute.com/v1alpha1` | Yes | Generic | Yes |
+| GCENodeClass | `karpenter.k8s.gcp/v1alpha1` | Yes | Generic | Yes |
 
 All provider-specific NodeClass variants are automatically detected and supported.
 
@@ -480,7 +480,7 @@ Radar has first-class renderers for **AWS (CAPA)**, **GCP (CAPG)**, and **Azure 
 
 ## GitOps
 
-See the main [README](../README.md#gitops) for GitOps integration details.
+See the main [README](../README.md#gitops) for the user-facing overview. This section covers integration coverage and capabilities.
 
 ### FluxCD
 
@@ -493,6 +493,10 @@ See the main [README](../README.md#gitops) for GitOps integration details.
 | HelmRelease | `helm.toolkit.fluxcd.io/v2` | Yes | Yes | Yes |
 | Alert | `notification.toolkit.fluxcd.io/v1beta3` | — | Yes | — |
 
+**Workflow operations**: Reconcile, Reconcile-with-source (Kustomization/HelmRelease), Suspend/Resume.
+
+**Diagnosis**: Conditions extracted to issues (Ready=False, Stalled=True, Reconciling=True). Per-resource diff and recent events not yet available for Flux (HelmRelease-installed resources don't carry `last-applied-configuration`; tracked in [#601](https://github.com/skyhook-io/radar/issues/601)).
+
 ### ArgoCD
 
 | CRD | Group | Topology | Detail View | AI Summary |
@@ -500,6 +504,20 @@ See the main [README](../README.md#gitops) for GitOps integration details.
 | Application | `argoproj.io/v1alpha1` | Yes | Yes | Yes |
 | ApplicationSet | `argoproj.io/v1alpha1` | — | Generic | — |
 | AppProject | `argoproj.io/v1alpha1` | — | Generic | — |
+
+**Workflow operations**: Sync (with options dialog: prune, dry-run, apply-only, force, replace, server-side apply, sync-options), Refresh, Hard refresh, Terminate, Suspend/Resume auto-sync, Rollback to historical revision, Selective sync of marked resources.
+
+**Diagnosis**:
+- **Per-resource field diff** computed from each resource's `kubectl.kubernetes.io/last-applied-configuration` annotation vs live spec — works for any Argo client-side-applied resource without calling the Argo API
+- **Recent events** surfaced inline per managed resource (5 most recent, namespace-RBAC-filtered)
+- **Stuck-drift-loop detector** — flags `sync=OutOfSync ∧ opPhase=Succeeded ∧ auto-sync on ∧ reconciledAt<30min` with the likely cause (mutating webhook, sibling controller, schema migration)
+- **Manual-drift detector** — calls out OutOfSync apps with auto-sync disabled
+- **Argo Application conditions** extracted to issues (ComparisonError, OrphanedResourceWarning, etc.) with type-aware severity and per-condition action text
+- **Operation-failure parser** recognizes 11 patterns: annotation-too-large, label-too-long, hook failure, admission webhook denial, RBAC, conflict, immutable field, schema migration, connectivity, etc.
+
+**Limitations**:
+- SSA-applied resources (`ServerSideApply=true` sync-option) lack the `last-applied-configuration` annotation; per-resource diff is unavailable for those rows. SSA fallback via `metadata.managedFields` and Argo API integration for canonical Git-rendered diffs are tracked in [#601](https://github.com/skyhook-io/radar/issues/601).
+- Single-cluster only: Application↔resource edges only render when Radar is connected to the cluster where the managed resources live (not necessarily the cluster running the Argo controller).
 
 ---
 
@@ -719,6 +737,116 @@ See the main [README](../README.md#gitops) for GitOps integration details.
 
 ---
 
+## Crossplane
+
+[Crossplane](https://crossplane.io/) extends Kubernetes with declarative cloud-resource management. Operators define platform APIs (`CompositeResourceDefinition`s + `Composition`s), and provider packages reconcile real cloud resources from `Managed Resource` CRs in any cloud or SaaS. Radar treats every provider as a first-class integration without needing per-provider code — detection is heuristic, based on spec shape.
+
+### What Radar Shows
+
+**Sidebar:** All Crossplane resources land under a single "Crossplane" group, including provider-shipped MR groups (`*.upbound.io`, `*.crossplane.io` subgroups). Provider-Kubernetes and Provider-Helm config groups are first-class.
+
+**Managed Resource Detail View** (the generic MR renderer — works for every provider, including Upbound AWS/GCP/Azure, provider-kubernetes, provider-helm, and any community provider):
+- Kind, API group, external-name annotation, deletion + management policies
+- Paused banner (`crossplane.io/paused: "true"`) — reconciliation suppressed by operator intent
+- Alert banner when `Synced=False` or `Ready=False` with the upstream cloud error verbatim
+- Linked `ProviderConfig` and (when this MR is composed) linked parent Composite via owner-ref walk
+- Collapsed `spec.forProvider` and `status.atProvider` JSON for deep diagnosis
+
+**Composite / Claim Detail View** — the killer feature:
+- Linked Composition and CompositionRevision (when pinned)
+- **Composed Resources list** — every entry in `spec.crossplane.resourceRefs` (v2) or `spec.resourceRefs` (v1) rendered as a clickable row with **its own live status badge**, fetched per-row via React Query. Clicking opens the composed resource's drawer.
+- Paused banner when `crossplane.io/paused: "true"`
+- For v1 Claims: linked bound XR
+
+**Composition Detail View:**
+- Mode badge (`Pipeline` violet vs `Resources` neutral)
+- Backed by linked XRD
+- Pipeline mode: numbered step cards, each with linked Function package, input kind, and expandable raw input
+- Resources mode: list of composed-resource templates with patch counts
+
+**XRD Detail View:**
+- Generated CR section: kind, plural, group, scope (v2 only — `Cluster` vs `Namespaced` badge)
+- Claim names (v1)
+- Versions table with `served` / `referenceable` / `deprecated` badges
+- Default + enforced Composition links
+- Connection-secret keys
+- `Established` / `Offered` conditions
+
+**Provider / Function / Configuration Detail View** (shared renderer):
+- Package OCI image, pull policy, revision activation policy
+- Current revision + identifier
+- Linked DeploymentRuntimeConfig (when set)
+- Linked package dependencies
+- For Configurations: list of installed XRDs/Compositions/Functions from `status.objectRefs`
+- Alert banners for `Installed=False` (install failed) or `Healthy=False` (controller unhealthy)
+
+**ProviderConfig Detail View:**
+- API group, credentials source (`InjectedIdentity`, `Secret`, etc.)
+- "N in use" status badge from `status.users`
+- Linked credentials Secret when applicable
+
+**Resource Browser:** MR list shows kind / external name / provider config / status; Provider list shows package, revision, status; Composition list shows mode, composite kind, function count; XRD list shows generated kind and claim kind.
+
+**Cluster Audit:** New `crossplaneStuck` check flags MRs/XRs/Claims reporting `Ready=False` or `Synced=False` for more than 5 minutes (warning) or 30 minutes (danger). Synced=False takes priority over Ready=False because it usually indicates the actionable problem (bad ProviderConfig, malformed spec, missing IAM). Same severity ramp as `stuckTerminating` for cross-surface consistency. Paused resources are deliberately suppressed.
+
+### v1 vs v2 Path Handling
+
+Crossplane v2 moved several fields under `spec.crossplane.*`. Radar's renderers and detectors check the v2 path first, fall back to v1 — no version detection needed. Fields handled this way:
+
+- `spec.crossplane.providerConfigRef` ↔ `spec.providerConfigRef`
+- `spec.crossplane.resourceRefs` ↔ `spec.resourceRefs`
+- `spec.crossplane.compositionRef` ↔ `spec.compositionRef`
+- `spec.crossplane.compositionRevisionRef` ↔ `spec.compositionRevisionRef`
+- `spec.crossplane.managementPolicies` ↔ `spec.managementPolicies`
+- `spec.crossplane.deletionPolicy` ↔ `spec.deletionPolicy`
+
+### Detection Heuristic (How Generic Renderers Match)
+
+- **Managed Resource**: presence of `spec.providerConfigRef` (v1 or v2 path)
+- **Composite / Claim**: presence of `spec.resourceRefs` (v1 or v2 path) AND not an MR
+- **v1 Claim**: also has `spec.resourceRef` (singular, pointing at the bound XR) + `spec.compositionRef`
+
+The set of MR CRD kinds is unbounded — every provider ships its own. Detection by spec shape lets Radar handle providers it has never seen without per-provider code.
+
+### RBAC
+
+The Helm chart's `rbac.crdGroups.crossplane: true` toggle grants read access to:
+- `crossplane.io`, `pkg.crossplane.io`, `apiextensions.crossplane.io` (Crossplane core)
+- `kubernetes.crossplane.io`, `helm.crossplane.io` (provider-kubernetes + provider-helm — useful in non-cloud installs)
+
+For Upbound provider CRDs (`s3.aws.upbound.io`, `compute.gcp.upbound.io`, etc.), list them in `rbac.additionalCrdGroups` — Kubernetes RBAC has no `apiGroups` wildcards. Alternative: set `rbac.crdGroups.all: true` to grant cluster-wide read on every CRD (simpler, broader).
+
+### Supported CRDs
+
+| CRD | Group | Topology | Detail View | AI Summary |
+|-----|-------|----------|-------------|------------|
+| Managed Resources (any provider) | `*.upbound.io`, `kubernetes.crossplane.io`, `helm.crossplane.io`, `*.crossplane.io` | — | Yes | — |
+| Composite Resources (XRs) | user-defined groups | — | Yes | — |
+| Claims (v1) | user-defined groups | — | Yes | — |
+| CompositeResourceDefinition | `apiextensions.crossplane.io/v1`, `v2` | — | Yes | — |
+| Composition | `apiextensions.crossplane.io/v1` | — | Yes | — |
+| CompositionRevision | `apiextensions.crossplane.io/v1` | — | Yes | — |
+| Provider | `pkg.crossplane.io/v1` | — | Yes | — |
+| Function | `pkg.crossplane.io/v1` | — | Yes | — |
+| Configuration | `pkg.crossplane.io/v1` | — | Yes | — |
+| ProviderConfig | per-provider group | — | Yes | — |
+
+### Out of Scope
+
+Deferred to a future "full Crossplane" pass:
+
+- Topology edges (XR → composed MRs in the graph view)
+- `Usage` / `ClusterUsage` rendering (delete-protection visualization)
+- Cloud-console deep links from `external-name`
+- Provider controller pod link with one-click log access
+- Connection-secret link on XRs
+- Mutating actions (force-reconcile, pause/unpause via `crossplane.io/paused`, manual sync)
+- Composition revision diff view (compare adjacent `CompositionRevision`s)
+- Per-XR insights pipeline (drift / events / plan / history surface — same shape as the GitOps detail page)
+- Per-provider specialized renderers (e.g. an S3-specific section that calls out bucket policy / versioning) — generic MR renderer covers the daily need; specialize on user demand
+
+---
+
 ## Kyverno
 
 [Kyverno](https://kyverno.io/) is a Kubernetes-native policy engine for validation, mutation, generation, and image verification — no new language required, policies are written as Kubernetes resources.
@@ -747,8 +875,10 @@ See the main [README](../README.md#gitops) for GitOps integration details.
 |-----|-------|----------|-------------|------------|
 | Policy | `kyverno.io/v1` | — | Yes | — |
 | ClusterPolicy | `kyverno.io/v1` | — | Yes | — |
-| PolicyReport | `wgpolicyk8s.io/v1alpha2` | — | Yes | — |
-| ClusterPolicyReport | `wgpolicyk8s.io/v1alpha2` | — | Yes | — |
+| PolicyReport | `wgpolicyk8s.io/v1alpha2` | — | Yes | Yes |
+| ClusterPolicyReport | `wgpolicyk8s.io/v1alpha2` | — | Yes | Yes |
+
+PolicyReport findings are policy posture, not live operational failure, so they are **not** part of the `/api/issues` stream. They surface per-resource: the PolicyReport detail view (above) and the `resourceContext` policy rollup on a resource fetched via `get_resource`. (The cluster audit — `/api/audit` + MCP `get_cluster_audit` — is radar's own static best-practice scanner and does **not** include PolicyReport results.)
 
 ---
 

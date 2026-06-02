@@ -1,7 +1,7 @@
 import { useState, useMemo, useCallback, useEffect } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
-import { ApiError, fetchJSON, isForbiddenError, useSecretCertExpiry, useTopPodMetrics, useTopNodeMetrics } from '../../api/client'
+import { ApiError, debugNamespaceLog, fetchJSON, isForbiddenError, useSecretCertExpiry, useTopPodMetrics, useTopNodeMetrics } from '../../api/client'
 import { apiUrl, getAuthHeaders, getCredentialsMode, getBasename } from '../../api/config'
 import { useAPIResources } from '../../api/apiResources'
 import { initNavigationMap } from '@skyhook-io/k8s-ui'
@@ -28,9 +28,10 @@ interface ResourcesViewProps {
   onResourceClick?: (resource: SelectedResource | null) => void
   onResourceClickYaml?: NavigateToResource
   onKindChange?: () => void
+  onClearNamespaces?: () => void
 }
 
-export function ResourcesView({ namespaces, selectedResource, onResourceClick, onResourceClickYaml, onKindChange }: ResourcesViewProps) {
+export function ResourcesView({ namespaces, selectedResource, onResourceClick, onResourceClickYaml, onKindChange, onClearNamespaces }: ResourcesViewProps) {
   const location = useLocation()
   const navigate = useNavigate()
 
@@ -52,7 +53,17 @@ export function ResourcesView({ namespaces, selectedResource, onResourceClick, o
     queryFn: async () => {
       const params = new URLSearchParams()
       if (namespaces.length > 0) params.set('namespaces', namespacesParam)
-      return fetchJSON<ResourceCountsResponse>(`/resource-counts?${params}`)
+      const startedAt = performance.now()
+      debugNamespaceLog('resources:counts-fetch-start', { namespaces, params: params.toString() })
+      try {
+        return await fetchJSON<ResourceCountsResponse>(`/resource-counts?${params}`)
+      } finally {
+        debugNamespaceLog('resources:counts-fetch-end', {
+          namespaces,
+          params: params.toString(),
+          durationMs: Math.round(performance.now() - startedAt),
+        })
+      }
     },
     staleTime: 10000,
     refetchInterval: 60000, // Safety net — SSE k8s_event drives near-real-time invalidation
@@ -75,9 +86,24 @@ export function ResourcesView({ namespaces, selectedResource, onResourceClick, o
       const params = new URLSearchParams()
       if (namespaces.length > 0) params.set('namespaces', namespacesParam)
       if (isSelectedCrd && selectedKind.group) params.set('group', selectedKind.group)
+      const startedAt = performance.now()
+      debugNamespaceLog('resources:selected-kind-fetch-start', {
+        kind: selectedKind.name,
+        group: isSelectedCrd ? selectedKind.group : '',
+        namespaces,
+        params: params.toString(),
+      })
       const res = await fetch(apiUrl(`/resources/${selectedKind.name}?${params}`), {
         credentials: getCredentialsMode(),
         headers: getAuthHeaders(),
+      })
+      debugNamespaceLog('resources:selected-kind-fetch-response', {
+        kind: selectedKind.name,
+        group: isSelectedCrd ? selectedKind.group : '',
+        namespaces,
+        params: params.toString(),
+        status: res.status,
+        durationMs: Math.round(performance.now() - startedAt),
       })
       if (!res.ok) {
         const errorData = await res.json().catch(() => ({ error: `HTTP ${res.status}` }))
@@ -166,6 +192,7 @@ export function ResourcesView({ namespaces, selectedResource, onResourceClick, o
       onResourceClick={onResourceClick}
       onResourceClickYaml={onResourceClickYaml}
       onKindChange={onKindChange}
+      onClearNamespaces={onClearNamespaces}
       // Injected data
       apiResources={apiResources}
       // Lightweight counts for sidebar (replaces 233 parallel queries)

@@ -1,10 +1,18 @@
 import { useState, type ReactNode, type JSX } from 'react'
-import { Server, HardDrive, Terminal as TerminalIcon, FileText, Activity, CirclePlay, FolderOpen, List, Eye, EyeOff } from 'lucide-react'
+import { Server, HardDrive, Terminal as TerminalIcon, FileText, Activity, CirclePlay, FolderOpen, List, Eye, EyeOff, Shield } from 'lucide-react'
 import { clsx } from 'clsx'
 import { Section, PropertyList, Property, ConditionsSection, CopyHandler, AlertBanner, ResourceLink } from '../../ui/drawer-components'
 import { formatResources, formatDuration, getPodProblems, getPodPhaseDisplay, healthColors, SEVERITY_DOT_COLOR } from '../resource-utils'
 import { getResourceStatusColor, SEVERITY_BADGE_BORDERED } from '../../../utils/badge-colors'
-import type { ResolvedEnvFrom } from '../../../types'
+import {
+  rbacVerbBadgeClass,
+  rbacResourceBadgeClass,
+  rbacApiGroupBadgeClass,
+} from '../../../utils/rbac-badges'
+import { resolvedEnvFromKey } from '../../../utils/env-from'
+import { detectBlastRadius, rulePermissivenessScore } from '../../../utils/rbac-blast-radius'
+import { RBACErrorSection, isRBACUnavailable } from './RBACErrorSection'
+import type { ResolvedEnvFrom, RBACSubjectResponse, RBACPolicyRule } from '../../../types'
 import { Tooltip } from '../../ui/Tooltip'
 import { MetricsChart } from '../../ui/MetricsChart'
 
@@ -75,6 +83,14 @@ interface PodRendererProps {
    * When provided, expands ConfigMap/Secret keys inline instead of showing "(all keys)".
    */
   resolvedEnvFrom?: ResolvedEnvFrom
+  /**
+   * RBAC reverse-lookup for the Pod's ServiceAccount. Undefined means the host
+   * didn't wire the fetch (Permissions section is omitted). Null means the
+   * fetch failed; the section renders an inline error.
+   */
+  rbacData?: RBACSubjectResponse | null
+  rbacLoading?: boolean
+  rbacError?: Error | null
 }
 
 // ── Env vars section — extracted to use hooks (useState for reveal) ──────────
@@ -180,7 +196,12 @@ function EnvVarsSection({
                   const isSecret = !!ef.secretRef
                   const sourceName = ef.configMapRef?.name ?? ef.secretRef?.name ?? 'unknown'
                   const prefix = ef.configMapRef ? 'ConfigMap' : ef.secretRef ? 'Secret' : 'Source'
-                  const resolved = resolvedEnvFrom?.[sourceName]
+                  const sourceKey = ef.configMapRef
+                    ? resolvedEnvFromKey('configmap', sourceName)
+                    : ef.secretRef
+                      ? resolvedEnvFromKey('secret', sourceName)
+                      : undefined
+                  const resolved = sourceKey ? resolvedEnvFrom?.[sourceKey] : undefined
                   return (
                     <div key={i} className="mb-1">
                       <div className="flex items-center gap-1.5 text-xs font-mono py-0.5">
@@ -240,6 +261,9 @@ export function PodRenderer({
   renderImageBrowser,
   renderPodBrowser,
   resolvedEnvFrom,
+  rbacData,
+  rbacLoading,
+  rbacError,
 }: PodRendererProps) {
   const containerStatuses = data.status?.containerStatuses || []
   const containers = data.spec?.containers || []
@@ -321,9 +345,12 @@ export function PodRenderer({
         <AlertBanner variant="error" title="Issues Detected">
           <ul className="text-xs space-y-1">
             {podProblems.map((p, i) => (
-              <li key={i} className="flex items-center gap-1.5">
-                <span className={clsx('w-1.5 h-1.5 rounded-full shrink-0', SEVERITY_DOT_COLOR[p.severity])} />
-                <span className="text-red-600 dark:text-red-400">{p.message}</span>
+              <li key={i} className="flex items-start gap-1.5">
+                <span className={clsx('w-1.5 h-1.5 rounded-full shrink-0 mt-1', SEVERITY_DOT_COLOR[p.severity])} />
+                <span className="text-red-600 dark:text-red-400">
+                  {p.message}
+                  {p.detail && <span className="text-theme-text-secondary">: {p.detail}</span>}
+                </span>
               </li>
             ))}
           </ul>
@@ -635,7 +662,8 @@ export function PodRenderer({
                       <span>Ports:</span>
                       {container.ports.map((p: any) => (
                         canPortForward && renderPortAction ? (
-                          <span key={`${p.containerPort}-${p.protocol || 'TCP'}`}>
+                          <span key={`${p.name || ''}-${p.containerPort}-${p.protocol || 'TCP'}`} className="inline-flex items-center gap-1">
+                            {p.name && <span className="text-theme-text-tertiary">{p.name}:</span>}
                             {renderPortAction({
                               namespace,
                               podName,
@@ -645,8 +673,8 @@ export function PodRenderer({
                             })}
                           </span>
                         ) : (
-                          <span key={`${p.containerPort}-${p.protocol || 'TCP'}`} className="text-theme-text-tertiary">
-                            {p.containerPort}/{p.protocol || 'TCP'}
+                          <span key={`${p.name || ''}-${p.containerPort}-${p.protocol || 'TCP'}`} className="text-theme-text-tertiary">
+                            {p.name ? `${p.name}: ` : ''}{p.containerPort}/{p.protocol || 'TCP'}
                           </span>
                         )
                       ))}
@@ -770,6 +798,22 @@ export function PodRenderer({
       {/* Conditions */}
       <ConditionsSection conditions={data.status?.conditions} />
 
+      {/* Permissions (via ServiceAccount) — placed below the diagnostic-
+       *  signal sections (status, containers, resource usage, conditions)
+       *  because it answers an incident/audit question ("if this Pod is
+       *  compromised, what does the attacker get?"), not a daily-browsing
+       *  one. Only renders when the host wired the RBAC fetch. */}
+      {rbacData !== undefined && (
+        <PodPermissionsSection
+          saName={data.spec?.serviceAccountName || 'default'}
+          namespace={data.metadata?.namespace || ''}
+          rbacData={rbacData}
+          loading={!!rbacLoading}
+          error={rbacError ?? null}
+          onNavigate={onNavigate}
+        />
+      )}
+
       {/* Image Filesystem Modal (via render prop) */}
       {selectedImage && renderImageBrowser && renderImageBrowser({
         image: selectedImage,
@@ -798,5 +842,175 @@ export function PodRenderer({
         },
       })}
     </>
+  )
+}
+
+// ============================================================================
+// POD PERMISSIONS SECTION (via ServiceAccount)
+// ============================================================================
+// Frames the SA's permissions in attacker terms — "if this Pod is compromised,
+// here's what the attacker gets". No OSS dashboard surfaces this view cleanly
+// today; the goal is to make blast radius legible without leaving the Pod page.
+
+interface PodPermissionsSectionProps {
+  saName: string
+  namespace: string
+  rbacData: RBACSubjectResponse | null
+  loading: boolean
+  error: Error | null
+  onNavigate?: (ref: { kind: string; namespace: string; name: string }) => void
+}
+
+// Verb categorization for the permissiveness scorer + blast-radius detector.
+// Badge colors come from the shared rbacVerbBadgeClass (theme-aware).
+// Blast-radius detection and scoring shared with Workload / ServiceAccount
+// renderers — see utils/rbac-blast-radius.ts.
+
+function PodPermissionsSection({
+  saName,
+  namespace,
+  rbacData,
+  loading,
+  error,
+  onNavigate,
+}: PodPermissionsSectionProps) {
+  const title = `Permissions via ServiceAccount: ${saName}`
+
+  if (loading) {
+    return (
+      <Section title={title} icon={Shield}>
+        <div className="text-sm text-theme-text-tertiary">Loading RBAC graph…</div>
+      </Section>
+    )
+  }
+  if (error) {
+    // Permissions is a bonus section here; when RBAC is simply not available
+    // (cluster-static) or forbidden, hide it rather than repeat a note on every
+    // Pod. Genuine faults still surface.
+    if (isRBACUnavailable(error)) return null
+    return <RBACErrorSection title={title} error={error} />
+  }
+  if (!rbacData) return null
+
+  const direct = rbacData.direct ?? []
+  const inheritedAll = (rbacData.inheritedFromGroups ?? []).flatMap((g) => g.bindings)
+  const inheritedCount = inheritedAll.length
+  const directCount = direct.length
+  const ruleCount = rbacData.flat?.length ?? 0
+
+  const blastReasons = detectBlastRadius(rbacData)
+
+  // Top-5 most-permissive rules across the full flat set.
+  const sortedRules = [...(rbacData.flat ?? [])].sort(
+    (a, b) => rulePermissivenessScore(b) - rulePermissivenessScore(a),
+  )
+  const previewRules = sortedRules.slice(0, 5)
+  const moreCount = Math.max(0, sortedRules.length - previewRules.length)
+
+  // Default collapsed: most operators opening a Pod want Status / Containers
+  // / Resource Usage / Events, not "what could this Pod do if compromised".
+  // That's an incident-response question, not daily-browsing. Auto-expand
+  // when something *is* risky so the page still shouts when it should.
+  const hasBlastRadius = blastReasons.length > 0
+  return (
+    <Section title={title} icon={Shield} defaultExpanded={hasBlastRadius}>
+      {/* Blast-radius alert — only when something risky was detected. */}
+      {blastReasons.length > 0 && (
+        <AlertBanner variant="warning" title="Blast radius">
+          <div className="text-xs">
+            If this Pod is compromised, the attacker inherits the
+            ServiceAccount's permissions, which include:
+          </div>
+          <ul className="mt-1.5 text-xs space-y-1">
+            {blastReasons.map((r, i) => (
+              <li key={i}>
+                <span className="text-theme-text-secondary">
+                  {r.binding.binding.kind} <span className="font-medium">{r.binding.binding.name}</span>
+                </span>{' '}
+                <span className="text-theme-text-tertiary">{r.reason}</span>
+              </li>
+            ))}
+          </ul>
+        </AlertBanner>
+      )}
+
+      {/* One-line summary */}
+      <div className="text-xs text-theme-text-tertiary mb-3">
+        {directCount} direct binding{directCount === 1 ? '' : 's'} ·{' '}
+        {inheritedCount} inherited via group
+        {inheritedCount === 1 ? '' : 's'} ·{' '}
+        {ruleCount} distinct rule{ruleCount === 1 ? '' : 's'}
+        {rbacData.truncated && <span className="text-orange-400"> (truncated)</span>}
+      </div>
+
+      {/* Top-N most-permissive rules. When the SA has zero permissions,
+       *  call that out explicitly — silence would look like a fetch error. */}
+      {previewRules.length === 0 ? (
+        <div className="text-sm text-theme-text-tertiary">
+          This ServiceAccount has no effective permissions in the cluster.
+        </div>
+      ) : (
+        <div className="space-y-1">
+          {previewRules.map((r, i) => (
+            <PodRulePreviewLine key={i} rule={r} />
+          ))}
+          {moreCount > 0 && (
+            <div className="text-xs text-theme-text-tertiary">
+              +{moreCount} more rule{moreCount === 1 ? '' : 's'} — open the
+              ServiceAccount to see the full grant.
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Footer link to the SA detail page where Effective Permissions
+       *  has the per-binding provenance + full rules. */}
+      <div className="mt-3 text-xs">
+        <ResourceLink
+          name={saName}
+          kind="serviceaccounts"
+          namespace={namespace}
+          label="View full permissions →"
+          onNavigate={onNavigate}
+        />
+      </div>
+    </Section>
+  )
+}
+
+function PodRulePreviewLine({ rule }: { rule: RBACPolicyRule }) {
+  const verbs = rule.verbs ?? []
+  const resources = rule.resources ?? []
+  const nonResourceURLs = rule.nonResourceURLs ?? []
+  const groups = rule.apiGroups ?? []
+  const isNonResource = resources.length === 0 && nonResourceURLs.length > 0
+  return (
+    <div className="flex items-center gap-1 flex-wrap text-xs">
+      {verbs.map((v) => (
+        <span key={v} className={clsx('badge', rbacVerbBadgeClass(v))}>{v}</span>
+      ))}
+      <span className="text-theme-text-secondary">on</span>
+      {isNonResource ? (
+        nonResourceURLs.map((u) => (
+          <span key={u} className="badge font-mono bg-theme-elevated text-theme-text-secondary">{u}</span>
+        ))
+      ) : (
+        resources.map((r) => (
+          <span key={r} className={clsx('badge', rbacResourceBadgeClass)}>
+            {r === '*' ? '*' : r}
+          </span>
+        ))
+      )}
+      {!isNonResource && groups.length > 0 && groups.some((g) => g !== '') && (
+        <>
+          <span className="text-theme-text-secondary">in</span>
+          {groups.map((g) => (
+            <span key={g} className={clsx('badge', rbacApiGroupBadgeClass)}>
+              {g === '' ? 'core' : g}
+            </span>
+          ))}
+        </>
+      )}
+    </div>
   )
 }

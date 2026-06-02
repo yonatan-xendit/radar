@@ -3,6 +3,8 @@ package prometheus
 import (
 	"strings"
 	"testing"
+
+	"github.com/skyhook-io/radar/pkg/prom"
 )
 
 func TestMemoryQueriesDedupeScrapeJobsBeforeSumming(t *testing.T) {
@@ -13,22 +15,22 @@ func TestMemoryQueriesDedupeScrapeJobsBeforeSumming(t *testing.T) {
 	}{
 		{
 			name:  "pod",
-			query: BuildQuery("Pod", "dify-new", "dify-new-postgresql-primary-0", CategoryMemory),
+			query: prom.BuildQuery("Pod", "dify-new", "dify-new-postgresql-primary-0", prom.CategoryMemory),
 			want:  "sum by (pod,namespace) (max by (pod,namespace,container)",
 		},
 		{
 			name:  "workload",
-			query: BuildQuery("StatefulSet", "dify-new", "dify-new-postgresql-primary", CategoryMemory),
+			query: prom.BuildQuery("StatefulSet", "dify-new", "dify-new-postgresql-primary", prom.CategoryMemory),
 			want:  "sum by (pod,namespace) (max by (pod,namespace,container)",
 		},
 		{
 			name:  "namespace",
-			query: BuildNamespaceQuery("dify-new", CategoryMemory),
+			query: prom.BuildNamespaceQuery("dify-new", prom.CategoryMemory),
 			want:  "sum(max by (namespace,pod,container)",
 		},
 		{
 			name:  "cluster",
-			query: BuildClusterQuery(CategoryMemory),
+			query: prom.BuildClusterQuery(prom.CategoryMemory),
 			want:  "sum(max by (namespace,pod,container)",
 		},
 	}

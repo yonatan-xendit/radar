@@ -1,10 +1,11 @@
 import { useState, useCallback, useEffect, useRef } from 'react'
 import { flushSync } from 'react-dom'
-import { PaneLoader } from '@skyhook-io/k8s-ui'
+import { FetchResult, useDockReservedHeight } from '@skyhook-io/k8s-ui'
 import { startViewTransitionSafe } from '@skyhook-io/k8s-ui/utils/view-transition'
 import { TRANSITION_DRAWER } from '../../utils/animation'
 import { useRefreshAnimation } from '../../hooks/useRefreshAnimation'
-import { X, Copy, Check, RefreshCw, Package, Code, History, FileText, Settings, Link2, Anchor, GitFork, BookOpen, ArrowUpCircle, Trash2 } from 'lucide-react'
+import { X, Copy, Check, RefreshCw, Package, Code, History, FileText, Settings, Link2, Anchor, GitFork, BookOpen, ArrowUpCircle, Trash2, GitBranch } from 'lucide-react'
+import { useNavigate } from 'react-router-dom'
 import { clsx } from 'clsx'
 import { useHelmRelease, useHelmManifest, useHelmValues, useHelmManifestDiff, useHelmUpgradeInfo, useHelmUninstall, upgradeWithProgress, rollbackWithProgress } from '../../api/client'
 import { useQueryClient } from '@tanstack/react-query'
@@ -37,6 +38,7 @@ const MAX_WIDTH_PERCENT = 0.8
 const DEFAULT_WIDTH = 1000
 
 export function HelmReleaseDrawer({ release, onClose, onNavigateToResource, isOpen = true }: HelmReleaseDrawerProps) {
+  const navigate = useNavigate()
   const [activeTab, setActiveTab] = useState<TabId>('overview')
   const [copied, setCopied] = useState<string | null>(null)
   const [drawerWidth, setDrawerWidth] = useState(DEFAULT_WIDTH)
@@ -58,7 +60,7 @@ export function HelmReleaseDrawer({ release, onClose, onNavigateToResource, isOp
   const canViewSensitive = canAtLeast('member')
   const helmNamespace = release.storageNamespace || release.namespace
 
-  const { data: releaseDetail, isLoading, refetch: refetchRelease } = useHelmRelease(
+  const { data: releaseDetail, isLoading, error: releaseError, refetch: refetchRelease } = useHelmRelease(
     helmNamespace,
     release.name
   )
@@ -279,6 +281,7 @@ export function HelmReleaseDrawer({ release, onClose, onNavigateToResource, isOp
   }
 
   const headerHeight = 49
+  const dockInset = useDockReservedHeight()
 
   const tabs: { id: TabId; label: string; icon: typeof Package }[] = [
     { id: 'overview', label: 'Overview', icon: Package },
@@ -301,7 +304,7 @@ export function HelmReleaseDrawer({ release, onClose, onNavigateToResource, isOp
         TRANSITION_DRAWER,
         isOpen ? 'translate-x-0 opacity-100' : 'translate-x-full opacity-0'
       )}
-      style={{ width: drawerWidth, top: headerHeight, height: `calc(100vh - ${headerHeight}px)` }}
+      style={{ width: drawerWidth, top: headerHeight, height: `calc(100vh - ${headerHeight}px - ${dockInset}px)` }}
     >
       {/* Resize handle */}
       <div
@@ -405,6 +408,20 @@ export function HelmReleaseDrawer({ release, onClose, onNavigateToResource, isOp
             </button>
           </div>
           <p className="text-sm text-theme-text-tertiary">{release.namespace}</p>
+          {releaseDetail?.managedByFluxHelmRelease && (
+            <button
+              type="button"
+              onClick={() => {
+                const [ns, name] = releaseDetail.managedByFluxHelmRelease!.split('/')
+                navigate(`/gitops/detail/helmreleases/${encodeURIComponent(ns || '_')}/${encodeURIComponent(name)}`)
+              }}
+              className="mt-1 inline-flex items-center gap-1 rounded border border-amber-500/40 bg-amber-500/10 px-1.5 py-0.5 text-[11px] text-amber-700 dark:text-amber-400 hover:bg-amber-500/20 transition-colors"
+              title={`Installed by Flux helm-controller via HelmRelease ${releaseDetail.managedByFluxHelmRelease}. Changes here would be reverted at the next reconcile.`}
+            >
+              <GitBranch className="w-3 h-3" />
+              Managed by Flux · {releaseDetail.managedByFluxHelmRelease}
+            </button>
+          )}
         </div>
 
         {/* Tabs */}
@@ -429,10 +446,8 @@ export function HelmReleaseDrawer({ release, onClose, onNavigateToResource, isOp
 
       {/* Content */}
       <div className="flex-1 overflow-y-auto" style={{ viewTransitionName: 'helm-drawer-content' }}>
-        {isLoading ? (
-          <PaneLoader className="h-32" />
-        ) : !releaseDetail ? (
-          <div className="flex items-center justify-center h-32 text-theme-text-tertiary">Release not found</div>
+        {!releaseDetail ? (
+          <FetchResult loading={isLoading} error={releaseError} notFoundMessage="Release not found" className="h-32" />
         ) : (
           <>
             {activeTab === 'overview' && (

@@ -58,6 +58,7 @@
           "additionalProperties": { "type": "boolean" },
           "properties": {
             "all": { "type": "boolean", "description": "Grant read access to ALL CRDs (overrides individual flags)." },
+            "apiRegistration": { "type": "boolean" },
             "argo": { "type": "boolean" },
             "awx": { "type": "boolean" },
             "certManager": { "type": "boolean" },
@@ -103,12 +104,14 @@
       }
     },
     "podAnnotations": { "type": "object", "additionalProperties": { "type": "string" } },
+    "podLabels": { "type": "object", "additionalProperties": { "type": "string" } },
     "podSecurityContext": { "type": "object" },
     "securityContext": { "type": "object" },
     "service": {
       "type": "object",
       "additionalProperties": true,
       "properties": {
+        "annotations": { "type": "object", "additionalProperties": { "type": "string" } },
         "type": { "type": "string", "enum": ["ClusterIP", "NodePort", "LoadBalancer"] },
         "port": { "type": "integer", "minimum": 1, "maximum": 65535 }
       }
@@ -161,7 +164,15 @@
       "properties": {
         "storage": { "type": "string", "enum": ["memory", "sqlite"] },
         "dbPath": { "type": "string" },
-        "historyLimit": { "type": "integer", "minimum": 1 }
+        "historyLimit": { "type": "integer", "minimum": 1 },
+        "retention": {
+          "type": "string",
+          "description": "SQLite retention as a Go duration (e.g. 168h). \"0\" disables cleanup."
+        },
+        "maxSize": {
+          "type": "string",
+          "description": "SQLite max storage size before pruning oldest events (e.g. 800Mi, 8Gi). \"0\" disables size pruning."
+        }
       }
     },
     "auth": {
@@ -242,7 +253,15 @@
       "type": "object",
       "additionalProperties": true,
       "properties": {
-        "prometheusUrl": { "type": "string" }
+        "prometheusUrl": { "type": "string" },
+        "prometheusHeaders": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "prometheusHeadersFromEnv": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        }
       }
     },
     "persistence": {
